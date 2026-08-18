@@ -1,0 +1,14 @@
+{
+  "name": "governor",
+  "owner": {
+    "name": "local"
+  },
+  "plugins": [
+    {
+      "name": "governor",
+      "source": "./",
+      "description": "Self-imposed usage cap for Claude Code, with live 5h/7d utilisation in the status line."
+    }
+  ],
+  "description": "Local marketplace for governor: a self-imposed cap on your share of the Claude Code usage window."
+}

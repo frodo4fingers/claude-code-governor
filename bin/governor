@@ -1,0 +1,939 @@
+#!/usr/bin/env python3
+"""governor - a self-imposed usage cap for Claude Code.
+
+Claude Code hands its status line command a JSON payload that contains the real
+server-side rate-limit utilisation, parsed from the
+``anthropic-ratelimit-unified-{5h,7d}-{utilization,reset}`` response headers::
+
+    "rate_limits": {"five_hour":  {"used_percentage": 41.2, "resets_at": 1755530000},
+                    "seven_day": {"used_percentage": 63.0, "resets_at": 1755900000}}
+
+Hooks do not receive that block, so the status line persists it to
+``~/.claude/governor/state.json`` and the hooks read it back. When utilisation
+crosses the cap you set for yourself, the PreToolUse hook answers
+``{"continue": false, "stopReason": ...}``, which halts the agent mid-task.
+
+Subcommands:
+  statusline     stdin: status line JSON -> rendered line, persists state
+  guard          stdin: hook JSON        -> hook decision JSON
+  session-start  stdin: hook JSON        -> refreshes the stable bin symlink
+  set/off/on/status/config/install/uninstall/index
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import datetime
+from pathlib import Path
+
+# --------------------------------------------------------------------------- paths
+
+HOME = Path(os.environ.get("GOVERNOR_HOME") or (Path.home() / ".claude" / "governor"))
+CONFIG_PATH = HOME / "config.json"
+STATE_PATH = HOME / "state.json"
+INDEX_PATH = HOME / "index.json"
+WARN_PATH = HOME / "warn.json"
+STABLE_BIN = HOME / "bin" / "governor"
+SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
+USER_COMMAND_PATH = Path.home() / ".claude" / "commands" / "governor.md"
+TRANSCRIPT_GLOB = str(Path.home() / ".claude" / "projects" / "*" / "*.jsonl")
+
+FIVE_HOURS = 5 * 3600
+SEVEN_DAYS = 7 * 86400
+
+DEFAULT_CONFIG = {
+    "enabled": True,
+    "five_hour_cap": None,      # percent of the 5h window you allow yourself, or None
+    "seven_day_cap": None,      # same for the weekly window
+    "warn_ratio": 0.8,          # warn once you pass warn_ratio * cap
+    "mode": "stop",             # "stop" = halt the agent, "warn" = only tell you
+    "show_tokens": True,        # add a token counter for the current window
+    "show_weekly": "auto",      # auto | always | never
+    "passthrough": None,        # status line command that ran before governor
+    "note": None,               # free text, e.g. who you are sharing the account with
+}
+
+# --------------------------------------------------------------------------- io
+
+def _read_json(path: Path, default):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return default
+
+
+def _write_json(path: Path, obj) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + f".tmp{os.getpid()}")
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(obj, fh, separators=(",", ":"))
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def load_config() -> dict:
+    cfg = dict(DEFAULT_CONFIG)
+    cfg.update(_read_json(CONFIG_PATH, {}) or {})
+    return cfg
+
+
+def save_config(cfg: dict) -> None:
+    _write_json(CONFIG_PATH, cfg)
+
+
+def read_stdin_json() -> dict:
+    try:
+        raw = sys.stdin.read()
+    except (OSError, ValueError):
+        return {}
+    if not raw.strip():
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+# --------------------------------------------------------------------------- limits
+
+def _epoch(value) -> float | None:
+    """Rate-limit resets arrive as unix seconds; tolerate milliseconds too."""
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return None
+    if num <= 0:
+        return None
+    return num / 1000.0 if num > 1e11 else num
+
+
+def update_state(payload: dict) -> dict:
+    """Merge a status line payload into the persisted state and return it."""
+    state = _read_json(STATE_PATH, {}) or {}
+    now = time.time()
+    limits = payload.get("rate_limits")
+    if isinstance(limits, dict) and limits:
+        clean = {}
+        for key in ("five_hour", "seven_day"):
+            block = limits.get(key)
+            if not isinstance(block, dict):
+                continue
+            try:
+                pct = float(block.get("used_percentage"))
+            except (TypeError, ValueError):
+                continue
+            clean[key] = {"used_percentage": pct, "resets_at": _epoch(block.get("resets_at"))}
+        if clean:
+            state["limits"] = clean
+            state["limits_updated_at"] = now
+    session = payload.get("session_id")
+    if session:
+        state["session_id"] = session
+    model = (payload.get("model") or {}).get("id")
+    if model:
+        state["model"] = model
+    state["updated_at"] = now
+    _write_json(STATE_PATH, state)
+    return state
+
+
+def read_limit(state: dict, key: str, now: float | None = None) -> dict | None:
+    """Return a usable {pct, resets_at, age} sample, or None if it cannot be trusted.
+
+    A sample is dropped once its own window has expired: the utilisation it
+    reports belongs to a window that no longer exists, so blocking on it would
+    keep the cap engaged forever.
+    """
+    now = time.time() if now is None else now
+    block = (state.get("limits") or {}).get(key)
+    if not isinstance(block, dict):
+        return None
+    try:
+        pct = float(block.get("used_percentage"))
+    except (TypeError, ValueError):
+        return None
+    resets_at = block.get("resets_at")
+    if resets_at and now >= float(resets_at):
+        return None
+    age = now - float(state.get("limits_updated_at") or 0)
+    window = FIVE_HOURS if key == "five_hour" else SEVEN_DAYS
+    if age > window:
+        return None
+    return {"pct": pct, "resets_at": resets_at, "age": age}
+
+
+def evaluate(cfg: dict, state: dict, now: float | None = None) -> dict:
+    """Decide what the caps say right now: allow / warn / stop."""
+    now = time.time() if now is None else now
+    verdict = {"action": "allow", "key": None, "pct": None, "cap": None, "resets_at": None}
+    if not cfg.get("enabled", True):
+        return verdict
+    for key, cap_field in (("five_hour", "five_hour_cap"), ("seven_day", "seven_day_cap")):
+        cap = cfg.get(cap_field)
+        if cap is None:
+            continue
+        sample = read_limit(state, key, now)
+        if sample is None:
+            continue
+        cap = float(cap)
+        pct = sample["pct"]
+        if pct >= cap:
+            action = "stop"
+        elif pct >= cap * float(cfg.get("warn_ratio", 0.8)):
+            action = "warn"
+        else:
+            continue
+        rank = {"allow": 0, "warn": 1, "stop": 2}
+        if rank[action] > rank[verdict["action"]]:
+            verdict = {"action": action, "key": key, "pct": pct, "cap": cap,
+                       "resets_at": sample["resets_at"], "age": sample["age"]}
+    return verdict
+
+
+# --------------------------------------------------------------------------- token index
+
+def _bucket_tokens(usage: dict) -> int:
+    total = 0
+    for field in ("input_tokens", "output_tokens", "cache_creation_input_tokens",
+                  "cache_read_input_tokens"):
+        try:
+            total += int(usage.get(field) or 0)
+        except (TypeError, ValueError):
+            pass
+    return total
+
+
+def index_update(budget_s: float = 0.35, now: float | None = None) -> dict:
+    """Incrementally fold transcript token usage into per-minute buckets.
+
+    Only bytes appended since the last run are parsed, so the common case is a
+    few kilobytes. Message ids are remembered for a week so that forked or
+    resumed sessions - which copy earlier turns into a new transcript - are not
+    counted twice.
+    """
+    now = time.time() if now is None else now
+    idx = _read_json(INDEX_PATH, {}) or {}
+    files = idx.get("files") or {}
+    buckets = idx.get("buckets") or {}
+    seen = idx.get("seen") or {}
+    horizon = now - SEVEN_DAYS
+    deadline = time.time() + budget_s
+    dirty = False
+
+    paths = glob.glob(TRANSCRIPT_GLOB)
+    paths.sort(key=lambda p: -os.path.getmtime(p) if os.path.exists(p) else 0)
+    for path in paths:
+        try:
+            stat = os.stat(path)
+        except OSError:
+            continue
+        if stat.st_mtime < horizon:
+            files.pop(path, None)
+            continue
+        entry = files.get(path) or {"offset": 0}
+        if stat.st_size == entry.get("offset"):
+            continue
+        if stat.st_size < entry.get("offset", 0):
+            entry = {"offset": 0}
+        if time.time() > deadline:
+            break
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(entry["offset"])
+                chunk = fh.read()
+        except OSError:
+            continue
+        consumed = chunk.rfind(b"\n") + 1
+        if consumed <= 0:
+            continue
+        for line in chunk[:consumed].split(b"\n"):
+            if not line.strip():
+                continue
+            try:
+                rec = json.loads(line.decode("utf-8", "replace"))
+            except ValueError:
+                continue
+            if rec.get("type") != "assistant":
+                continue
+            message = rec.get("message") or {}
+            usage = message.get("usage") or {}
+            if not usage:
+                continue
+            uid = message.get("id") or rec.get("requestId")
+            if not uid:
+                continue
+            uid = uid[-16:]
+            ts = _parse_ts(rec.get("timestamp"))
+            if ts is None or ts < horizon:
+                continue
+            if uid in seen:
+                continue
+            minute = str(int(ts // 60) * 60)
+            seen[uid] = int(ts)
+            buckets[minute] = buckets.get(minute, 0) + _bucket_tokens(usage)
+            dirty = True
+        entry["offset"] += consumed
+        files[path] = entry
+        dirty = True
+
+    if dirty:
+        cutoff = int(horizon)
+        buckets = {k: v for k, v in buckets.items() if int(k) >= cutoff}
+        seen = {k: v for k, v in seen.items() if v >= cutoff}
+        _write_json(INDEX_PATH, {"files": files, "buckets": buckets, "seen": seen})
+    return {"files": files, "buckets": buckets, "seen": seen}
+
+
+def _parse_ts(value) -> float | None:
+    if not isinstance(value, str) or len(value) < 19:
+        return None
+    try:
+        return datetime.datetime.strptime(value[:19], "%Y-%m-%dT%H:%M:%S") \
+            .replace(tzinfo=datetime.timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
+def tokens_since(start_ts: float, idx: dict | None = None) -> int:
+    idx = idx if idx is not None else (_read_json(INDEX_PATH, {}) or {})
+    buckets = idx.get("buckets") or {}
+    return sum(v for k, v in buckets.items() if int(k) >= int(start_ts))
+
+
+# --------------------------------------------------------------------------- rendering
+
+RESET = "\033[0m"
+
+
+def _c(code: str, text: str) -> str:
+    if os.environ.get("NO_COLOR") or not text:
+        return text
+    return f"\033[{code}m{text}{RESET}"
+
+
+def fmt_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    hours, rem = divmod(seconds, 3600)
+    minutes = rem // 60
+    if hours:
+        return f"{hours}h{minutes:02d}m"
+    if minutes:
+        return f"{minutes}m"
+    return f"{seconds}s"
+
+
+def fmt_tokens(count: int) -> str:
+    if count >= 1_000_000:
+        return f"{count / 1_000_000:.1f}M"
+    if count >= 1_000:
+        return f"{count / 1_000:.0f}k"
+    return str(count)
+
+
+def bar(pct: float, cap: float | None, width: int = 12) -> str:
+    pct = max(0.0, min(100.0, pct))
+    filled = int(round(pct / 100.0 * width))
+    cap_cell = None
+    if cap is not None and 0 < cap < 100:
+        cap_cell = min(width - 1, int(cap / 100.0 * width))
+    cells = []
+    for i in range(width):
+        if cap_cell is not None and i == cap_cell:
+            cells.append(_c("38;5;203", "█" if i < filled else "│"))
+        elif i < filled:
+            cells.append("█")
+        else:
+            cells.append("░")
+    return "".join(cells)
+
+
+def tone(pct: float, cap: float | None, warn_ratio: float) -> str:
+    if cap is None:
+        return "38;5;245" if pct < 60 else ("38;5;179" if pct < 85 else "38;5;203")
+    if pct >= cap:
+        return "38;5;203"
+    if pct >= cap * warn_ratio:
+        return "38;5;179"
+    return "38;5;114"
+
+
+def render(cfg: dict, state: dict, now: float | None = None) -> str:
+    now = time.time() if now is None else now
+    warn_ratio = float(cfg.get("warn_ratio", 0.8))
+    cap = cfg.get("five_hour_cap")
+    cap = float(cap) if cap is not None else None
+    sample = read_limit(state, "five_hour", now)
+    stopped = evaluate(cfg, state, now)["action"] == "stop" and cfg.get("mode", "stop") == "stop"
+    segments = []
+
+    if sample is None:
+        segments.append(_c("38;5;245", "⛽ 5h —"))
+    else:
+        pct = sample["pct"]
+        colour = tone(pct, cap, warn_ratio)
+        icon = _c("38;5;203", "⛔") if stopped else "⛽"
+        head = f"{icon} 5h {bar(pct, cap)} {_c(colour, f'{pct:.0f}%')}"
+        if cap is not None:
+            head += _c("38;5;203" if stopped else "38;5;245", f" cap {cap:.0f}%")
+        if sample["resets_at"]:
+            head += _c("38;5;245", f" ↻{fmt_duration(float(sample['resets_at']) - now)}")
+        segments.append(head)
+
+    show_weekly = cfg.get("show_weekly", "auto")
+    weekly = read_limit(state, "seven_day", now)
+    if weekly and (show_weekly == "always"
+                   or (show_weekly == "auto" and (cfg.get("seven_day_cap") is not None
+                                                  or weekly["pct"] >= 50))):
+        wcap = cfg.get("seven_day_cap")
+        wcap = float(wcap) if wcap is not None else None
+        segments.append(_c(tone(weekly["pct"], wcap, warn_ratio), f"7d {weekly['pct']:.0f}%"))
+
+    if cfg.get("show_tokens", True):
+        try:
+            idx = index_update(now=now)
+            if sample and sample["resets_at"]:
+                start = float(sample["resets_at"]) - FIVE_HOURS
+            else:
+                start = now - FIVE_HOURS
+            segments.append(_c("38;5;245", f"{fmt_tokens(tokens_since(start, idx))} tok"))
+        except Exception:  # never let bookkeeping break the status line
+            pass
+
+    if cfg.get("enabled", True) is False and cfg.get("five_hour_cap") is not None:
+        segments.append(_c("38;5;245", "cap paused"))
+
+    return _c("38;5;245", " · ").join(segments)
+
+
+# --------------------------------------------------------------------------- messages
+
+def stop_message(verdict: dict, cfg: dict, now: float | None = None) -> str:
+    now = time.time() if now is None else now
+    window = "5h window" if verdict["key"] == "five_hour" else "weekly window"
+    lines = [f"governor: {window} at {verdict['pct']:.1f}%, your cap is {verdict['cap']:.0f}%. "
+             f"Stopping here so the rest stays available."]
+    if verdict.get("resets_at"):
+        lines.append(f"Window resets in {fmt_duration(float(verdict['resets_at']) - now)} "
+                     f"({time.strftime('%H:%M', time.localtime(float(verdict['resets_at'])))}).")
+    if cfg.get("note"):
+        note = str(cfg["note"]).strip()
+        lines.append(note if note.endswith((".", "!", "?")) else note + ".")
+    lines.append("Lift it with /governor off, or raise it with /governor <percent>.")
+    return " ".join(lines)
+
+
+def warn_message(verdict: dict, now: float | None = None) -> str:
+    now = time.time() if now is None else now
+    window = "5h" if verdict["key"] == "five_hour" else "weekly"
+    tail = ""
+    if verdict.get("resets_at"):
+        tail = f", resets in {fmt_duration(float(verdict['resets_at']) - now)}"
+    return (f"governor: {window} usage {verdict['pct']:.1f}% of your {verdict['cap']:.0f}% cap"
+            f"{tail}. Work will stop at the cap.")
+
+
+# --------------------------------------------------------------------------- guard
+
+SUBCOMMANDS = ("status", "set", "off", "on", "pause", "config", "index",
+               "install", "uninstall", "guard", "statusline", "session-start")
+# Matches the binary however it is spelled - bare name, absolute path, ~ path,
+# quoted - as long as one of our subcommands follows it.
+SELF_CALL_RE = re.compile(
+    r"""(?:^|[\s;|&(/'"])governor['"]?\s+(?:--\S+\s+)*(?:%s)\b""" % "|".join(SUBCOMMANDS))
+
+
+def is_self_call(event: str, payload: dict) -> bool:
+    """Never let the cap block the commands that lift the cap.
+
+    Without this the guard deadlocks: it halts every tool call, including the
+    Bash call that would run `governor off`.
+    """
+    if event == "UserPromptSubmit":
+        prompt = (payload.get("prompt") or "").strip().lower()
+        return prompt.startswith("/governor") or prompt.startswith("/user:governor")
+    if (payload.get("tool_name") or "") != "Bash":
+        return False
+    command = (payload.get("tool_input") or {}).get("command") or ""
+    return bool(SELF_CALL_RE.search(command)) or str(STABLE_BIN) in command
+
+
+def throttled_warn(interval: float = 300.0, now: float | None = None) -> bool:
+    now = time.time() if now is None else now
+    data = _read_json(WARN_PATH, {}) or {}
+    if now - float(data.get("last") or 0) < interval:
+        return False
+    _write_json(WARN_PATH, {"last": now})
+    return True
+
+
+def cmd_guard(args) -> int:
+    if os.environ.get("GOVERNOR_DISABLE"):
+        return 0
+    payload = read_stdin_json()
+    event = args.event or payload.get("hook_event_name") or "PreToolUse"
+    cfg = load_config()
+    if not cfg.get("enabled", True):
+        return 0
+    if cfg.get("five_hour_cap") is None and cfg.get("seven_day_cap") is None:
+        return 0
+    if is_self_call(event, payload):
+        return 0
+
+    state = _read_json(STATE_PATH, {}) or {}
+    verdict = evaluate(cfg, state)
+
+    if verdict["action"] == "stop" and cfg.get("mode", "stop") == "stop":
+        json.dump({"continue": False, "stopReason": stop_message(verdict, cfg)}, sys.stdout)
+        sys.stdout.write("\n")
+        return 0
+    if verdict["action"] in ("stop", "warn"):
+        if throttled_warn():
+            message = (stop_message(verdict, cfg) if verdict["action"] == "stop"
+                       else warn_message(verdict))
+            json.dump({"systemMessage": message, "suppressOutput": True}, sys.stdout)
+            sys.stdout.write("\n")
+    return 0
+
+
+# --------------------------------------------------------------------------- commands
+
+def cmd_statusline(args) -> int:
+    payload = read_stdin_json()
+    cfg = load_config()
+    state = update_state(payload)
+    chunks = []
+    passthrough = cfg.get("passthrough")
+    if passthrough:
+        try:
+            proc = subprocess.run(passthrough, shell=True, input=json.dumps(payload),
+                                  capture_output=True, text=True, timeout=3)
+            if proc.stdout.strip():
+                chunks.append(proc.stdout.strip())
+        except (OSError, subprocess.SubprocessError):
+            pass
+    line = render(cfg, state)
+    if line:
+        chunks.append(line)
+    sys.stdout.write(" ".join(chunks))
+    return 0
+
+
+def cmd_session_start(args) -> int:
+    """Keep ~/.claude/governor/bin/governor pointing at the installed plugin."""
+    _ensure_stable_bin()
+    cfg = load_config()
+    cap = cfg.get("five_hour_cap")
+    if cap is not None and cfg.get("enabled", True):
+        note = f" ({cfg['note']})" if cfg.get("note") else ""
+        json.dump({"hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": (
+                f"governor: a self-imposed cap of {float(cap):.0f}% of the 5-hour usage "
+                f"window is active{note}. Work is halted automatically at the cap; the user "
+                f"lifts it with /governor off."),
+        }}, sys.stdout)
+        sys.stdout.write("\n")
+    return 0
+
+
+def _parse_percent(text: str) -> float:
+    value = float(str(text).strip().rstrip("%"))
+    if not 0 < value <= 100:
+        raise ValueError("percent must be between 0 and 100")
+    return value
+
+
+def cmd_set(args) -> int:
+    cfg = load_config()
+    field = "seven_day_cap" if args.weekly else "five_hour_cap"
+    try:
+        cfg[field] = _parse_percent(args.percent)
+    except ValueError as exc:
+        print(f"governor: {exc}", file=sys.stderr)
+        return 1
+    cfg["enabled"] = True
+    if args.note is not None:
+        cfg["note"] = args.note or None
+    if args.warn is not None:
+        cfg["warn_ratio"] = max(0.0, min(1.0, args.warn))
+    if args.mode:
+        cfg["mode"] = args.mode
+    save_config(cfg)
+    return cmd_status(args)
+
+
+def cmd_off(args) -> int:
+    cfg = load_config()
+    if args.weekly:
+        cfg["seven_day_cap"] = None
+    elif args.all:
+        cfg["five_hour_cap"] = None
+        cfg["seven_day_cap"] = None
+    else:
+        cfg["five_hour_cap"] = None
+    cfg["enabled"] = True
+    save_config(cfg)
+    return cmd_status(args)
+
+
+def cmd_pause(args) -> int:
+    cfg = load_config()
+    cfg["enabled"] = False
+    save_config(cfg)
+    return cmd_status(args)
+
+
+def cmd_on(args) -> int:
+    cfg = load_config()
+    cfg["enabled"] = True
+    save_config(cfg)
+    return cmd_status(args)
+
+
+def cmd_config(args) -> int:
+    cfg = load_config()
+    if args.key is None:
+        print(json.dumps(cfg, indent=2, sort_keys=True))
+        return 0
+    if args.key not in DEFAULT_CONFIG:
+        print(f"governor: unknown key {args.key!r}; known: {', '.join(sorted(DEFAULT_CONFIG))}",
+              file=sys.stderr)
+        return 1
+    if args.value is None:
+        print(json.dumps(cfg.get(args.key)))
+        return 0
+    raw = args.value
+    if raw.lower() in ("null", "none", ""):
+        parsed = None
+    elif raw.lower() in ("true", "false"):
+        parsed = raw.lower() == "true"
+    else:
+        try:
+            parsed = float(raw) if "." in raw else int(raw)
+        except ValueError:
+            parsed = raw
+    cfg[args.key] = parsed
+    save_config(cfg)
+    print(json.dumps({args.key: parsed}))
+    return 0
+
+
+def cmd_status(args) -> int:
+    now = time.time()
+    cfg = load_config()
+    state = _read_json(STATE_PATH, {}) or {}
+    verdict = evaluate(cfg, state, now)
+    five = read_limit(state, "five_hour", now)
+    seven = read_limit(state, "seven_day", now)
+    tokens = None
+    try:
+        idx = index_update(budget_s=1.5, now=now)
+        start = (float(five["resets_at"]) - FIVE_HOURS
+                 if five and five["resets_at"] else now - FIVE_HOURS)
+        tokens = tokens_since(start, idx)
+    except Exception:
+        pass
+
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "config": cfg, "verdict": verdict, "five_hour": five, "seven_day": seven,
+            "tokens_in_window": tokens, "state_age_s": now - float(state.get("updated_at") or 0),
+        }, indent=2, default=str))
+        return 0
+
+    print(f"governor  {'active' if cfg.get('enabled', True) else 'paused'}"
+          f"   mode={cfg.get('mode', 'stop')}")
+    cap = cfg.get("five_hour_cap")
+    if five:
+        line = f"  5h window   {five['pct']:.1f}% used"
+        if cap is not None:
+            line += f"   cap {float(cap):.0f}%"
+        if five["resets_at"]:
+            line += f"   resets in {fmt_duration(float(five['resets_at']) - now)}"
+        print(line)
+    else:
+        print("  5h window   unknown - open an interactive session so the status line "
+              "can sample the rate-limit headers")
+    if seven:
+        wcap = cfg.get("seven_day_cap")
+        line = f"  7d window   {seven['pct']:.1f}% used"
+        if wcap is not None:
+            line += f"   cap {float(wcap):.0f}%"
+        if seven["resets_at"]:
+            line += f"   resets in {fmt_duration(float(seven['resets_at']) - now)}"
+        print(line)
+    if tokens is not None:
+        print(f"  tokens      {fmt_tokens(tokens)} in the current 5h window")
+    if cfg.get("note"):
+        print(f"  note        {cfg['note']}")
+    print(f"  verdict     {verdict['action']}")
+    if verdict["action"] == "stop":
+        print(f"              {stop_message(verdict, cfg, now)}")
+    return 0
+
+
+def cmd_index(args) -> int:
+    idx = index_update(budget_s=args.budget)
+    print(json.dumps({"files": len(idx.get("files") or {}),
+                      "buckets": len(idx.get("buckets") or {}),
+                      "messages": len(idx.get("seen") or {})}))
+    return 0
+
+
+def _statusline_command() -> str:
+    return f'python3 "{Path(__file__).resolve()}" statusline'
+
+
+def _plugin_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def _ensure_stable_bin() -> None:
+    try:
+        STABLE_BIN.parent.mkdir(parents=True, exist_ok=True)
+        target = Path(__file__).resolve()
+        current = STABLE_BIN.resolve() if STABLE_BIN.exists() else None
+        if current != target:
+            tmp = STABLE_BIN.with_name(f".governor.{os.getpid()}")
+            os.symlink(target, tmp)
+            os.replace(tmp, STABLE_BIN)
+    except OSError:
+        pass
+
+
+def cmd_install(args) -> int:
+    """Do the whole setup: register the plugin, wire the status line, set a cap.
+
+    Everything lands in one settings file, so there is nothing to click through
+    in /plugin. Claude Code has to be restarted afterwards to load the plugin.
+    """
+    root = _plugin_root()
+    settings_path = Path(args.settings).expanduser() if args.settings else SETTINGS_PATH
+    settings = _read_json(settings_path, {}) or {}
+    cfg = load_config()
+    changes: dict = {}
+    notes: list[str] = []
+
+    if not args.no_plugin:
+        manifest = root / ".claude-plugin" / "marketplace.json"
+        if not manifest.exists():
+            print(f"governor: no marketplace manifest at {manifest}", file=sys.stderr)
+            return 1
+        market = (_read_json(manifest, {}) or {}).get("name") or "governor"
+        marketplaces = dict(settings.get("extraKnownMarketplaces") or {})
+        marketplaces[market] = {"source": {"source": "directory", "path": str(root)}}
+        plugins = dict(settings.get("enabledPlugins") or {})
+        plugins[f"governor@{market}"] = True
+        changes["extraKnownMarketplaces"] = marketplaces
+        changes["enabledPlugins"] = plugins
+        notes.append(f"plugin governor@{market} enabled from {root}")
+
+    if not args.no_statusline:
+        current = (settings.get("statusLine") or {}).get("command")
+        if current and "governor" not in current:
+            cfg["passthrough"] = current
+            notes.append(f"existing status line chained: {current}")
+        changes["statusLine"] = {"type": "command", "command": _statusline_command(),
+                                 "refreshInterval": args.refresh}
+
+    command_link = None
+    if not args.no_command:
+        # A plugin skill is always namespaced (/governor:governor). A user-level
+        # command gives the short /governor form. Symlinked, so it tracks the repo
+        # instead of going stale like the plugin's snapshot copy does.
+        command_link = root / "commands" / "governor.md"
+        notes.append(f"/governor -> {USER_COMMAND_PATH} (symlink to {command_link})")
+
+    if args.cap is not None:
+        try:
+            cfg["five_hour_cap"] = _parse_percent(args.cap)
+            cfg["enabled"] = True
+            notes.append(f"5h cap set to {cfg['five_hour_cap']:.0f}%")
+        except ValueError as exc:
+            print(f"governor: {exc}", file=sys.stderr)
+            return 1
+
+    if args.dry_run:
+        print(f"would edit {settings_path}:")
+        print(json.dumps(changes, indent=2))
+        print("\nwould write ~/.claude/governor/config.json:")
+        print(json.dumps({k: cfg[k] for k in ("five_hour_cap", "passthrough", "enabled")}, indent=2))
+        for note in notes:
+            print(f"  - {note}")
+        return 0
+
+    backup = None
+    if settings_path.exists():
+        backup = settings_path.with_suffix(f".json.governor-backup.{int(time.time())}")
+        backup.write_text(settings_path.read_text(encoding="utf-8"), encoding="utf-8")
+    settings.update(changes)
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+    save_config(cfg)
+    _ensure_stable_bin()
+    if command_link is not None:
+        try:
+            USER_COMMAND_PATH.parent.mkdir(parents=True, exist_ok=True)
+            if USER_COMMAND_PATH.is_symlink() or USER_COMMAND_PATH.exists():
+                USER_COMMAND_PATH.unlink()
+            USER_COMMAND_PATH.symlink_to(command_link)
+        except OSError as exc:
+            print(f"governor: could not link {USER_COMMAND_PATH}: {exc}", file=sys.stderr)
+
+    print(f"governor: wrote {settings_path}")
+    for note in notes:
+        print(f"  - {note}")
+    if backup:
+        print(f"  - backup at {backup}")
+    print("Restart Claude Code to load the plugin, then: /governor status")
+    return 0
+
+
+def cmd_uninstall(args) -> int:
+    settings_path = Path(args.settings).expanduser() if args.settings else SETTINGS_PATH
+    settings = _read_json(settings_path, {}) or {}
+    cfg = load_config()
+    touched = []
+
+    current = (settings.get("statusLine") or {}).get("command") or ""
+    if "governor" in current:
+        if cfg.get("passthrough"):
+            settings["statusLine"] = {"type": "command", "command": cfg["passthrough"]}
+            touched.append(f"status line restored to {cfg['passthrough']}")
+        else:
+            settings.pop("statusLine", None)
+            touched.append("status line removed")
+
+    plugins = dict(settings.get("enabledPlugins") or {})
+    for key in [k for k in plugins if k.startswith("governor@")]:
+        plugins.pop(key)
+        touched.append(f"{key} disabled")
+    if plugins != (settings.get("enabledPlugins") or {}):
+        settings["enabledPlugins"] = plugins
+    marketplaces = dict(settings.get("extraKnownMarketplaces") or {})
+    entry = marketplaces.get("governor")
+    if isinstance(entry, dict) and (entry.get("source") or {}).get("source") == "directory":
+        marketplaces.pop("governor")
+        settings["extraKnownMarketplaces"] = marketplaces
+        touched.append("marketplace deregistered")
+
+    if USER_COMMAND_PATH.is_symlink():
+        try:
+            if "governor" in str(USER_COMMAND_PATH.resolve()):
+                USER_COMMAND_PATH.unlink()
+                touched.append(f"{USER_COMMAND_PATH} removed")
+        except OSError:
+            pass
+
+    if not touched:
+        print("governor: nothing to undo")
+        return 0
+    settings_path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+    for note in touched:
+        print(f"  - {note}")
+    print(f"governor: {settings_path} updated; the cap in ~/.claude/governor/ was left alone")
+    return 0
+
+
+# --------------------------------------------------------------------------- cli
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="governor", description=__doc__.splitlines()[0])
+    sub = parser.add_subparsers(dest="cmd")
+
+    p = sub.add_parser("statusline", help="render the status line (stdin: status line JSON)")
+    p.set_defaults(func=cmd_statusline)
+
+    p = sub.add_parser("guard", help="hook decision (stdin: hook JSON)")
+    p.add_argument("--event", default=None)
+    p.set_defaults(func=cmd_guard)
+
+    p = sub.add_parser("session-start", help="session bootstrap hook")
+    p.set_defaults(func=cmd_session_start)
+
+    p = sub.add_parser("set", help="cap yourself at N percent of the window")
+    p.add_argument("percent")
+    p.add_argument("--weekly", action="store_true", help="cap the 7d window instead")
+    p.add_argument("--warn", type=float, default=None, help="warn at this fraction of the cap")
+    p.add_argument("--mode", choices=["stop", "warn"], default=None)
+    p.add_argument("--note", default=None, help="reminder shown when the cap fires")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_set)
+
+    p = sub.add_parser("off", help="remove the cap")
+    p.add_argument("--weekly", action="store_true")
+    p.add_argument("--all", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_off)
+
+    p = sub.add_parser("pause", help="keep the cap but stop enforcing it")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_pause)
+
+    p = sub.add_parser("on", help="resume enforcing the cap")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_on)
+
+    p = sub.add_parser("status", help="show usage, cap and verdict")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("config", help="read or write a config key")
+    p.add_argument("key", nargs="?")
+    p.add_argument("value", nargs="?")
+    p.set_defaults(func=cmd_config)
+
+    p = sub.add_parser("index", help="refresh the token index")
+    p.add_argument("--budget", type=float, default=5.0)
+    p.set_defaults(func=cmd_index)
+
+    p = sub.add_parser("install", help="register the plugin and wire the status line")
+    p.add_argument("--cap", default=None, help="set the 5h cap while installing, e.g. --cap 50")
+    p.add_argument("--refresh", type=int, default=10, help="status line refresh seconds")
+    p.add_argument("--settings", default=None, help="settings file to edit (default ~/.claude/settings.json)")
+    p.add_argument("--no-plugin", action="store_true", help="skip marketplace/plugin registration")
+    p.add_argument("--no-statusline", action="store_true", help="skip the status line")
+    p.add_argument("--no-command", action="store_true",
+                   help="skip the ~/.claude/commands/governor.md link (/governor stays namespaced)")
+    p.add_argument("--dry-run", action="store_true", help="print the edit without making it")
+    p.set_defaults(func=cmd_install)
+
+    p = sub.add_parser("uninstall", help="undo the install")
+    p.add_argument("--settings", default=None)
+    p.set_defaults(func=cmd_uninstall)
+    return parser
+
+
+def main(argv: list[str]) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "func", None):
+        parser.print_help()
+        return 0
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except BrokenPipeError:
+        sys.exit(0)
+    except Exception as exc:  # a hook must never take the session down with it
+        if os.environ.get("GOVERNOR_DEBUG"):
+            raise
+        print(f"governor: {exc}", file=sys.stderr)
+        sys.exit(0)

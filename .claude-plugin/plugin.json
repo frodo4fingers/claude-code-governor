@@ -1,0 +1,15 @@
+{
+  "name": "governor",
+  "version": "0.1.3",
+  "description": "Cap your own share of the Claude Code 5-hour and weekly usage windows. Shows real rate-limit utilisation under the prompt and halts the agent when it crosses the cap you set for yourself.",
+  "keywords": [
+    "usage",
+    "rate-limit",
+    "statusline",
+    "budget",
+    "quota"
+  ],
+  "author": {
+    "name": "frodo4fingers"
+  }
+}

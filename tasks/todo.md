@@ -36,3 +36,12 @@ The one structural awkwardness: hooks are not given that block, so the status
 line has to persist it for them. That makes the status line a required
 component rather than a cosmetic one, and makes headless runs depend on a
 sample taken by an interactive session. Documented rather than hidden.
+
+## Publishing
+- [x] MIT LICENSE, author frodo4fingers, homepage/repository metadata
+- [x] Public README (no local paths, marketplace install instructions)
+- [x] statusLine points at ~/.claude/governor/bin/governor, not a versioned cache dir
+      (a plugin update deletes the old directory and would break the gauge)
+- [x] `install` skips marketplace registration when already installed from one
+- [ ] push to github.com/frodo4fingers/claude-code-governor
+- [ ] tag v0.2.0 once pushed (`claude plugin tag` validates manifest agreement)

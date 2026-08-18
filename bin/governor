@@ -695,11 +695,23 @@ def cmd_index(args) -> int:
 
 
 def _statusline_command() -> str:
-    return f'python3 "{Path(__file__).resolve()}" statusline'
+    """Always the stable symlink.
+
+    Installing from a marketplace puts the plugin in a versioned directory
+    (~/.claude/plugins/cache/<mkt>/<plugin>/<version>/), which disappears on the
+    next update. `SessionStart` re-points ~/.claude/governor/bin/governor at
+    whatever the current version is, so that path keeps working.
+    """
+    return f'python3 "{STABLE_BIN}" statusline'
 
 
 def _plugin_root() -> Path:
     return Path(__file__).resolve().parent.parent
+
+
+def _is_versioned_install(root: Path) -> bool:
+    """True when running from ~/.claude/plugins/cache/<mkt>/<plugin>/<version>/."""
+    return (Path.home() / ".claude" / "plugins" / "cache") in root.parents
 
 
 def _ensure_stable_bin() -> None:
@@ -728,6 +740,10 @@ def cmd_install(args) -> int:
     changes: dict = {}
     notes: list[str] = []
 
+    if _is_versioned_install(root):
+        # already installed through a marketplace - re-registering the cache
+        # directory as a second, local marketplace would be wrong
+        args.no_plugin = True
     if not args.no_plugin:
         manifest = root / ".claude-plugin" / "marketplace.json"
         if not manifest.exists():
@@ -750,13 +766,13 @@ def cmd_install(args) -> int:
         changes["statusLine"] = {"type": "command", "command": _statusline_command(),
                                  "refreshInterval": args.refresh}
 
-    command_link = None
+    command_source = None
     if not args.no_command:
         # A plugin skill is always namespaced (/governor:governor). A user-level
-        # command gives the short /governor form. Symlinked, so it tracks the repo
-        # instead of going stale like the plugin's snapshot copy does.
-        command_link = root / "commands" / "governor.md"
-        notes.append(f"/governor -> {USER_COMMAND_PATH} (symlink to {command_link})")
+        # command gives the short /governor form.
+        command_source = root / "commands" / "governor.md"
+        how = "copy" if _is_versioned_install(root) else "symlink"
+        notes.append(f"/governor -> {USER_COMMAND_PATH} ({how} of {command_source})")
 
     if args.cap is not None:
         try:
@@ -785,14 +801,19 @@ def cmd_install(args) -> int:
     settings_path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
     save_config(cfg)
     _ensure_stable_bin()
-    if command_link is not None:
+    if command_source is not None:
         try:
             USER_COMMAND_PATH.parent.mkdir(parents=True, exist_ok=True)
             if USER_COMMAND_PATH.is_symlink() or USER_COMMAND_PATH.exists():
                 USER_COMMAND_PATH.unlink()
-            USER_COMMAND_PATH.symlink_to(command_link)
+            if _is_versioned_install(root):
+                # a symlink into a versioned directory dies on the next update
+                USER_COMMAND_PATH.write_text(command_source.read_text(encoding="utf-8"),
+                                             encoding="utf-8")
+            else:
+                USER_COMMAND_PATH.symlink_to(command_source)
         except OSError as exc:
-            print(f"governor: could not link {USER_COMMAND_PATH}: {exc}", file=sys.stderr)
+            print(f"governor: could not install {USER_COMMAND_PATH}: {exc}", file=sys.stderr)
 
     print(f"governor: wrote {settings_path}")
     for note in notes:
@@ -831,9 +852,11 @@ def cmd_uninstall(args) -> int:
         settings["extraKnownMarketplaces"] = marketplaces
         touched.append("marketplace deregistered")
 
-    if USER_COMMAND_PATH.is_symlink():
+    if USER_COMMAND_PATH.is_symlink() or USER_COMMAND_PATH.exists():
         try:
-            if "governor" in str(USER_COMMAND_PATH.resolve()):
+            ours = ("governor" in str(USER_COMMAND_PATH.resolve())
+                    or "governor" in USER_COMMAND_PATH.read_text(encoding="utf-8")[:400])
+            if ours:
                 USER_COMMAND_PATH.unlink()
                 touched.append(f"{USER_COMMAND_PATH} removed")
         except OSError:

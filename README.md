@@ -66,7 +66,7 @@ the gauge. `/governor uninstall` puts everything back.
 
 </details>
 
-Requirements: Python 3.8+ on `PATH`, Claude Code 2.1+, and a subscription login
+Requirements: Python 3.12+ on `PATH`, Claude Code 2.1+, and a subscription login
 (see [limitations](#what-it-is-not)).
 
 ## Where the number comes from

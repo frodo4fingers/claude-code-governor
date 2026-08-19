@@ -172,8 +172,16 @@ Nothing is written inside the plugin — all state lives in `~/.claude/governor/
 ```bash
 git clone git@github.com:frodo4fingers/claude-code-governor.git
 cd claude-code-governor
-claude --plugin-dir .        # load this checkout live, no install
+python3 -m unittest discover -s tests    # no dependencies, stdlib only
+claude --plugin-dir .                    # load this checkout live, no install
 ```
+
+The tests run against a throwaway `GOVERNOR_HOME` and a throwaway transcript
+directory (`GOVERNOR_TRANSCRIPTS`), so they never read or write your real
+`~/.claude`. Two of them matter more than the rest: the self-call whitelist,
+because a miss there locks you out of `/governor off`, and the expiry handling
+in `read_limit`, because a miss there keeps the cap engaged after the window has
+already rolled over.
 
 Installing copies the directory into
 `~/.claude/plugins/cache/governor/governor/<version>/`, and the cache is keyed by

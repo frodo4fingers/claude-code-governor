@@ -24,6 +24,20 @@
 - [x] One-shot install.sh - marketplace + plugin + status line via settings alone
 - [x] Publish as a git repo so the other account holder can install it by URL
 
+## Tests
+- [x] `tests/test_governor.py` — stdlib unittest, no deps, hermetic
+      (`GOVERNOR_HOME` + `GOVERNOR_TRANSCRIPTS` both redirected to a tmpdir)
+- [x] Self-call whitelist: 9 spellings allowed, 8 foreign commands blocked,
+      1 documented permissive case (`echo "governor off"`) pinned so a future
+      tightening is a visible diff
+- [x] `read_limit` expiry, staleness, malformed samples — the fail-open path
+- [x] `evaluate` bands, disabled config, worst-window-wins ranking
+- [x] Index: dedupe by message id, horizon, incremental offsets, half-written
+      line, truncated file
+- [x] Guard as a subprocess: the actual `{"continue": false}` JSON, warn mode,
+      throttling, the three no-op paths, garbage stdin
+- [ ] CI (GitHub Actions) running the suite on push
+
 ## Review
 
 Data source was the whole question. Two options existed: estimate from

@@ -43,7 +43,8 @@ WARN_PATH = HOME / "warn.json"
 STABLE_BIN = HOME / "bin" / "governor"
 SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 USER_COMMAND_PATH = Path.home() / ".claude" / "commands" / "governor.md"
-TRANSCRIPT_GLOB = str(Path.home() / ".claude" / "projects" / "*" / "*.jsonl")
+TRANSCRIPT_GLOB = (os.environ.get("GOVERNOR_TRANSCRIPTS")
+                   or str(Path.home() / ".claude" / "projects" / "*" / "*.jsonl"))
 
 FIVE_HOURS = 5 * 3600
 SEVEN_DAYS = 7 * 86400

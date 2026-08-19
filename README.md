@@ -17,8 +17,11 @@ wanted for the rest of the day.
 
 ```
 /governor 50          stop me once the 5-hour window is half spent
+/governor 50 for 3h   same, but the cap releases itself after three hours
 /governor weekly 80   same for the weekly window
 /governor status      where do I stand
+/governor log         what has happened - caps set, hit, released
+/governor budget 4M   cap tokens instead of a percentage
 /governor pause       keep the cap, stop enforcing it
 /governor off         drop the cap
 ```
@@ -136,6 +139,93 @@ Once stopped, `UserPromptSubmit` refuses new prompts too, so the task cannot be
 casually restarted. When the window rolls over, the sample expires and the
 guard releases on its own — no command needed.
 
+## Warnings
+
+Two of them. The first at `warn_ratio` (80% of your cap) says how much is spent.
+The second at `escalate_ratio` (95%) says how much room is **left**, in points,
+because at that distance a single large turn can cross the rest:
+
+```
+governor: 5h usage 48.5%, 1.5 points under your 50% cap, resets in 1h00m.
+The next turn may reach it - finish up, or raise the cap now.
+```
+
+Warnings are rate-limited to one per five minutes, but a change of tier is never
+held back — escalation delivered after the halt it was meant to precede would be
+worthless. An `escalate_ratio` that is not strictly above `warn_ratio` switches
+the second tier off entirely; it could not be reached without swallowing the
+first warning.
+
+## Caps that release themselves
+
+```
+/governor 50 for 3h
+```
+
+The cap applies for three hours and then removes itself — useful when the split
+is "the account is mine until lunch" rather than a standing rule. Durations are
+`45s`, `90m`, `3h`, `2h30m`, `2d`, up to `7d`.
+
+A bare number is refused. `for 3` reads as hours or minutes with equal
+plausibility, and a self-releasing cap that guesses wrong fails quietly: either
+it is gone when you expected it, or still there hours later. The status line
+shows the remaining time next to the cap (`cap 50% for 1h20m`), and the expiry
+is per window — an expiring 5h cap does not touch a standing weekly one.
+
+Nothing runs in the background to do the removal. The status line and the
+session-start hook clear an expired cap the next time they run, and `evaluate`
+ignores one that has passed, so the cap stops applying at the moment it expires
+whether or not anything has cleaned it up yet.
+
+## Token budgets
+
+For logins that report no rate-limit utilisation — API key, Bedrock, Vertex —
+there is no percentage to cap. Those sessions can cap absolute tokens instead:
+
+```
+/governor budget 4M          stop me after four million tokens in the window
+/governor budget 20M weekly  same for the week
+/governor budget off         remove it
+```
+
+`4M`, `500k`, `4000000` and `4,000,000` all read the same. The gauge becomes
+`900k/1.0M tok`, and the warnings and the halt speak in tokens rather than
+percentages.
+
+The count comes from the same transcript index as the token counter, so it
+covers every session on the machine, deduplicated by message id. Two caveats,
+both inherent rather than fixable:
+
+- **The window is rolling** when there are no headers — the last five hours from
+  now, not the real window, because nothing tells us when that window began. On
+  a subscription login the count is anchored to the real reset time instead.
+- **It counts what the transcripts recorded.** A session whose transcript is
+  missing or pruned is invisible to it.
+
+Both caps can be set at once; whichever is closer to its limit decides. On a
+subscription login prefer the percentage cap — it is measured against the real
+window rather than reconstructed.
+
+## History
+
+```
+$ governor log
+  2026-08-19 08:08  set      5h  cap 50% until 11:08
+  2026-08-19 09:41  stop     5h  55.4% used, cap 50%
+  2026-08-19 11:08  expired  5h  cap 50% removed
+
+  3 entries, 1 halt
+```
+
+`~/.claude/governor/log.jsonl`, one JSON object per line, trimmed to 30 days.
+Records caps set and removed, caps that released themselves, pauses, and halts.
+`--days N` narrows the range (`--days 0` for everything) and `--json` prints the
+raw records.
+
+A halt is recorded **once per usage window**, not once per blocked tool call —
+the guard runs before every call, so the obvious implementation writes hundreds
+of identical lines for a single cap being reached.
+
 ## Config
 
 `~/.claude/governor/config.json`, editable with `/governor` or
@@ -145,7 +235,12 @@ guard releases on its own — no command needed.
 |---|---|---|
 | `five_hour_cap` | `null` | percent of the 5h window you allow yourself |
 | `seven_day_cap` | `null` | same for the weekly window |
+| `five_hour_expires_at` | `null` | unix time the 5h cap releases itself (`--for`) |
+| `seven_day_expires_at` | `null` | same for the weekly cap |
 | `warn_ratio` | `0.8` | warn once past this fraction of the cap |
+| `escalate_ratio` | `0.95` | warn again, louder, this close to the cap |
+| `token_budget` | `null` | absolute tokens allowed per 5h window |
+| `token_budget_weekly` | `null` | same for the week |
 | `mode` | `stop` | `stop` halts the agent, `warn` only tells you |
 | `show_tokens` | `true` | token counter in the status line |
 | `show_weekly` | `auto` | `auto` shows 7d when capped or above 50% |
@@ -164,8 +259,8 @@ Nothing is written inside the plugin — all state lives in `~/.claude/governor/
   is discarded once its own window has expired, so a stale sample can never keep
   the cap engaged forever — it fails open, not shut.
 - **No `rate_limits` block, no percentage cap.** API-key, Bedrock and Vertex
-  users do not get those headers; the gauge shows `5h —` and only the token
-  counter works.
+  users do not get those headers; the gauge shows `5h —` and the percentage cap
+  has nothing to measure. Use [token budgets](#token-budgets) there.
 
 ## Development
 

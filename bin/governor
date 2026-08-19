@@ -51,6 +51,8 @@ DEFAULT_CONFIG = {
     "enabled": True,
     "five_hour_cap": None,      # percent of the 5h window you allow yourself, or None
     "seven_day_cap": None,      # same for the weekly window
+    "five_hour_expires_at": None,   # unix time the 5h cap releases itself, or None
+    "seven_day_expires_at": None,   # same for the weekly cap
     "warn_ratio": 0.8,          # warn once you pass warn_ratio * cap
     "mode": "stop",             # "stop" = halt the agent, "warn" = only tell you
     "show_tokens": True,        # add a token counter for the current window
@@ -175,15 +177,42 @@ def read_limit(state: dict, key: str, now: float | None = None) -> dict | None:
     return {"pct": pct, "resets_at": resets_at, "age": age}
 
 
+CAP_FIELDS = (("five_hour", "five_hour_cap", "five_hour_expires_at"),
+              ("seven_day", "seven_day_cap", "seven_day_expires_at"))
+
+
+def expire_caps(cfg: dict, now: float | None = None) -> bool:
+    """Drop caps whose --for window has passed. True if cfg changed.
+
+    Kept out of evaluate() so that the decision stays a pure function of the
+    config it is handed; the commands that already write config do the clearing.
+    """
+    now = time.time() if now is None else now
+    changed = False
+    for _key, cap_field, expiry_field in CAP_FIELDS:
+        expires_at = cfg.get(expiry_field)
+        if expires_at is None:
+            continue
+        if now >= float(expires_at):
+            cfg[cap_field] = None
+            cfg[expiry_field] = None
+            changed = True
+    return changed
+
+
 def evaluate(cfg: dict, state: dict, now: float | None = None) -> dict:
     """Decide what the caps say right now: allow / warn / stop."""
     now = time.time() if now is None else now
-    verdict = {"action": "allow", "key": None, "pct": None, "cap": None, "resets_at": None}
+    verdict = {"action": "allow", "key": None, "pct": None, "cap": None,
+               "resets_at": None, "expires_at": None}
     if not cfg.get("enabled", True):
         return verdict
-    for key, cap_field in (("five_hour", "five_hour_cap"), ("seven_day", "seven_day_cap")):
+    for key, cap_field, expiry_field in CAP_FIELDS:
         cap = cfg.get(cap_field)
         if cap is None:
+            continue
+        expires_at = cfg.get(expiry_field)
+        if expires_at is not None and now >= float(expires_at):
             continue
         sample = read_limit(state, key, now)
         if sample is None:
@@ -199,7 +228,8 @@ def evaluate(cfg: dict, state: dict, now: float | None = None) -> dict:
         rank = {"allow": 0, "warn": 1, "stop": 2}
         if rank[action] > rank[verdict["action"]]:
             verdict = {"action": action, "key": key, "pct": pct, "cap": cap,
-                       "resets_at": sample["resets_at"], "age": sample["age"]}
+                       "resets_at": sample["resets_at"], "age": sample["age"],
+                       "expires_at": expires_at}
     return verdict
 
 
@@ -387,7 +417,11 @@ def render(cfg: dict, state: dict, now: float | None = None) -> str:
         icon = _c("38;5;203", "⛔") if stopped else "⛽"
         head = f"{icon} 5h {bar(pct, cap)} {_c(colour, f'{pct:.0f}%')}"
         if cap is not None:
-            head += _c("38;5;203" if stopped else "38;5;245", f" cap {cap:.0f}%")
+            label = f" cap {cap:.0f}%"
+            expires_at = cfg.get("five_hour_expires_at")
+            if expires_at is not None and float(expires_at) > now:
+                label += f" for {fmt_duration(float(expires_at) - now)}"
+            head += _c("38;5;203" if stopped else "38;5;245", label)
         if sample["resets_at"]:
             head += _c("38;5;245", f" ↻{fmt_duration(float(sample['resets_at']) - now)}")
         segments.append(head)
@@ -428,6 +462,9 @@ def stop_message(verdict: dict, cfg: dict, now: float | None = None) -> str:
     if verdict.get("resets_at"):
         lines.append(f"Window resets in {fmt_duration(float(verdict['resets_at']) - now)} "
                      f"({time.strftime('%H:%M', time.localtime(float(verdict['resets_at'])))}).")
+    if verdict.get("expires_at"):
+        lines.append(f"The cap lifts itself in "
+                     f"{fmt_duration(float(verdict['expires_at']) - now)}.")
     if cfg.get("note"):
         note = str(cfg["note"]).strip()
         lines.append(note if note.endswith((".", "!", "?")) else note + ".")
@@ -513,6 +550,8 @@ def cmd_guard(args) -> int:
 def cmd_statusline(args) -> int:
     payload = read_stdin_json()
     cfg = load_config()
+    if expire_caps(cfg):
+        save_config(cfg)
     state = update_state(payload)
     chunks = []
     passthrough = cfg.get("passthrough")
@@ -535,6 +574,8 @@ def cmd_session_start(args) -> int:
     """Keep ~/.claude/governor/bin/governor pointing at the installed plugin."""
     _ensure_stable_bin()
     cfg = load_config()
+    if expire_caps(cfg):
+        save_config(cfg)
     cap = cfg.get("five_hour_cap")
     if cap is not None and cfg.get("enabled", True):
         note = f" ({cfg['note']})" if cfg.get("note") else ""
@@ -549,6 +590,34 @@ def cmd_session_start(args) -> int:
     return 0
 
 
+_DURATION_RE = re.compile(r"(\d+(?:\.\d+)?)([smhd])")
+
+
+def _parse_duration(text: str) -> float:
+    """'3h', '90m', '2h30m' -> seconds.
+
+    A bare number is refused on purpose. Hours and minutes are both plausible
+    readings of `--for 3`, and getting it wrong on a cap that releases itself
+    fails quietly - the cap is simply gone, or still there, hours off.
+    """
+    raw = "".join(str(text).split()).lower()   # "2h 30m" and "3 h" both read fine
+    units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    total = 0.0
+    consumed = 0
+    for match in _DURATION_RE.finditer(raw):
+        if match.start() != consumed:
+            break
+        total += float(match.group(1)) * units[match.group(2)]
+        consumed = match.end()
+    if not raw or consumed != len(raw):
+        raise ValueError(f"cannot read duration {text!r} - try 3h, 90m or 2h30m")
+    if total <= 0:
+        raise ValueError("duration must be positive")
+    if total > SEVEN_DAYS:
+        raise ValueError("duration must be at most 7d")
+    return total
+
+
 def _parse_percent(text: str) -> float:
     value = float(str(text).strip().rstrip("%"))
     if not 0 < value <= 100:
@@ -559,11 +628,17 @@ def _parse_percent(text: str) -> float:
 def cmd_set(args) -> int:
     cfg = load_config()
     field = "seven_day_cap" if args.weekly else "five_hour_cap"
+    expiry_field = "seven_day_expires_at" if args.weekly else "five_hour_expires_at"
     try:
-        cfg[field] = _parse_percent(args.percent)
+        cap = _parse_percent(args.percent)
+        # A cap set without --for is open ended, even if the previous one was not.
+        duration = getattr(args, "duration", None)
+        expires = time.time() + _parse_duration(duration) if duration is not None else None
     except ValueError as exc:
         print(f"governor: {exc}", file=sys.stderr)
         return 1
+    cfg[field] = cap
+    cfg[expiry_field] = expires
     cfg["enabled"] = True
     if args.note is not None:
         cfg["note"] = args.note or None
@@ -578,12 +653,14 @@ def cmd_set(args) -> int:
 def cmd_off(args) -> int:
     cfg = load_config()
     if args.weekly:
-        cfg["seven_day_cap"] = None
+        cleared = ("seven_day",)
     elif args.all:
-        cfg["five_hour_cap"] = None
-        cfg["seven_day_cap"] = None
+        cleared = ("five_hour", "seven_day")
     else:
-        cfg["five_hour_cap"] = None
+        cleared = ("five_hour",)
+    for name in cleared:
+        cfg[f"{name}_cap"] = None
+        cfg[f"{name}_expires_at"] = None
     cfg["enabled"] = True
     save_config(cfg)
     return cmd_status(args)
@@ -631,9 +708,20 @@ def cmd_config(args) -> int:
     return 0
 
 
+def _expiry_note(cfg: dict, name: str, now: float) -> str:
+    expires_at = cfg.get(f"{name}_expires_at")
+    if expires_at is None or float(expires_at) <= now:
+        return ""
+    expires_at = float(expires_at)
+    return (f" for {fmt_duration(expires_at - now)}"
+            f" (until {time.strftime('%H:%M', time.localtime(expires_at))})")
+
+
 def cmd_status(args) -> int:
     now = time.time()
     cfg = load_config()
+    if expire_caps(cfg, now):
+        save_config(cfg)
     state = _read_json(STATE_PATH, {}) or {}
     verdict = evaluate(cfg, state, now)
     five = read_limit(state, "five_hour", now)
@@ -660,7 +748,7 @@ def cmd_status(args) -> int:
     if five:
         line = f"  5h window   {five['pct']:.1f}% used"
         if cap is not None:
-            line += f"   cap {float(cap):.0f}%"
+            line += f"   cap {float(cap):.0f}%{_expiry_note(cfg, 'five_hour', now)}"
         if five["resets_at"]:
             line += f"   resets in {fmt_duration(float(five['resets_at']) - now)}"
         print(line)
@@ -671,7 +759,7 @@ def cmd_status(args) -> int:
         wcap = cfg.get("seven_day_cap")
         line = f"  7d window   {seven['pct']:.1f}% used"
         if wcap is not None:
-            line += f"   cap {float(wcap):.0f}%"
+            line += f"   cap {float(wcap):.0f}%{_expiry_note(cfg, 'seven_day', now)}"
         if seven["resets_at"]:
             line += f"   resets in {fmt_duration(float(seven['resets_at']) - now)}"
         print(line)
@@ -890,6 +978,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("set", help="cap yourself at N percent of the window")
     p.add_argument("percent")
     p.add_argument("--weekly", action="store_true", help="cap the 7d window instead")
+    p.add_argument("--for", dest="duration", default=None,
+                   help="release the cap again after this long, e.g. 3h or 90m")
     p.add_argument("--warn", type=float, default=None, help="warn at this fraction of the cap")
     p.add_argument("--mode", choices=["stop", "warn"], default=None)
     p.add_argument("--note", default=None, help="reminder shown when the cap fires")

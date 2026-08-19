@@ -17,6 +17,7 @@ wanted for the rest of the day.
 
 ```
 /governor 50          stop me once the 5-hour window is half spent
+/governor 50 for 3h   same, but the cap releases itself after three hours
 /governor weekly 80   same for the weekly window
 /governor status      where do I stand
 /governor pause       keep the cap, stop enforcing it
@@ -136,6 +137,27 @@ Once stopped, `UserPromptSubmit` refuses new prompts too, so the task cannot be
 casually restarted. When the window rolls over, the sample expires and the
 guard releases on its own — no command needed.
 
+## Caps that release themselves
+
+```
+/governor 50 for 3h
+```
+
+The cap applies for three hours and then removes itself — useful when the split
+is "the account is mine until lunch" rather than a standing rule. Durations are
+`45s`, `90m`, `3h`, `2h30m`, `2d`, up to `7d`.
+
+A bare number is refused. `for 3` reads as hours or minutes with equal
+plausibility, and a self-releasing cap that guesses wrong fails quietly: either
+it is gone when you expected it, or still there hours later. The status line
+shows the remaining time next to the cap (`cap 50% for 1h20m`), and the expiry
+is per window — an expiring 5h cap does not touch a standing weekly one.
+
+Nothing runs in the background to do the removal. The status line and the
+session-start hook clear an expired cap the next time they run, and `evaluate`
+ignores one that has passed, so the cap stops applying at the moment it expires
+whether or not anything has cleaned it up yet.
+
 ## Config
 
 `~/.claude/governor/config.json`, editable with `/governor` or
@@ -145,6 +167,8 @@ guard releases on its own — no command needed.
 |---|---|---|
 | `five_hour_cap` | `null` | percent of the 5h window you allow yourself |
 | `seven_day_cap` | `null` | same for the weekly window |
+| `five_hour_expires_at` | `null` | unix time the 5h cap releases itself (`--for`) |
+| `seven_day_expires_at` | `null` | same for the weekly cap |
 | `warn_ratio` | `0.8` | warn once past this fraction of the cap |
 | `mode` | `stop` | `stop` halts the agent, `warn` only tells you |
 | `show_tokens` | `true` | token counter in the status line |

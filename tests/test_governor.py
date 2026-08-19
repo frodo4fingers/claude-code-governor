@@ -251,6 +251,80 @@ class TestEvaluate(unittest.TestCase):
         self.assertEqual(v["key"], "seven_day")
 
 
+# --------------------------------------------------------------- self-release
+
+class TestParseDuration(unittest.TestCase):
+    def test_accepted_forms(self):
+        for text, seconds in [("45s", 45), ("90m", 5400), ("3h", 10800), ("2d", 172800),
+                              ("2h30m", 9000), ("2h 30m", 9000), ("3 h", 10800),
+                              ("1.5h", 5400), ("3H", 10800)]:
+            self.assertEqual(gov._parse_duration(text), seconds, text)
+
+    def test_a_bare_number_is_refused(self):
+        # `--for 3` reads as hours or minutes with equal plausibility, and
+        # guessing wrong on a self-releasing cap fails silently.
+        with self.assertRaises(ValueError):
+            gov._parse_duration("3")
+
+    def test_other_rejects(self):
+        for text in ("", "abc", "h", "3x", "-1h", "3h30", "0h", "0s"):
+            with self.assertRaises(ValueError, msg=text):
+                gov._parse_duration(text)
+
+    def test_upper_bound_is_a_week(self):
+        self.assertEqual(gov._parse_duration("7d"), gov.SEVEN_DAYS)
+        with self.assertRaises(ValueError):
+            gov._parse_duration("8d")
+
+
+class TestExpiringCaps(unittest.TestCase):
+    def cfg(self, **kw):
+        return dict(gov.DEFAULT_CONFIG, five_hour_cap=50, **kw)
+
+    def test_a_live_cap_still_stops(self):
+        now = 1000.0
+        v = gov.evaluate(self.cfg(five_hour_expires_at=now + 600),
+                         state_at(60.0, now, now + 3600), now)
+        self.assertEqual(v["action"], "stop")
+        self.assertEqual(v["expires_at"], now + 600)
+
+    def test_an_expired_cap_no_longer_stops(self):
+        now = 1000.0
+        v = gov.evaluate(self.cfg(five_hour_expires_at=now - 1),
+                         state_at(99.0, now, now + 3600), now)
+        self.assertEqual(v["action"], "allow")
+
+    def test_expiry_is_per_window(self):
+        now = 1000.0
+        cfg = self.cfg(five_hour_expires_at=now - 1, seven_day_cap=60)
+        state = state_at(99.0, now, now + 3600,
+                         weekly={"used_percentage": 70.0, "resets_at": now + 86400})
+        v = gov.evaluate(cfg, state, now)
+        self.assertEqual(v["action"], "stop")        # the weekly cap has no expiry
+        self.assertEqual(v["key"], "seven_day")
+
+    def test_expire_caps_clears_only_what_has_passed(self):
+        now = 1000.0
+        cfg = self.cfg(five_hour_expires_at=now - 1,
+                       seven_day_cap=60, seven_day_expires_at=now + 60)
+        self.assertTrue(gov.expire_caps(cfg, now))
+        self.assertIsNone(cfg["five_hour_cap"])
+        self.assertIsNone(cfg["five_hour_expires_at"])
+        self.assertEqual(cfg["seven_day_cap"], 60)
+
+    def test_expire_caps_is_a_no_op_without_expiries(self):
+        cfg = self.cfg()
+        self.assertFalse(gov.expire_caps(cfg, 1000.0))
+        self.assertEqual(cfg["five_hour_cap"], 50)
+
+    def test_the_halt_says_the_cap_releases_itself(self):
+        now = 1000.0
+        verdict = {"action": "stop", "key": "five_hour", "pct": 55.0, "cap": 50.0,
+                   "resets_at": None, "expires_at": now + 5400}
+        text = gov.stop_message(verdict, dict(gov.DEFAULT_CONFIG), now)
+        self.assertIn("lifts itself in 1h30m", text)
+
+
 # ------------------------------------------------------------------ formatting
 
 class TestFormatting(unittest.TestCase):
@@ -449,6 +523,19 @@ class TestRender(Sandboxed):
         line = gov.render(self.cfg(five_hour_cap=50), state_at(41.0, now, now + 8040), now)
         self.assertEqual(line, "⛽ 5h █████░│░░░░░ 41% cap 50% ↻2h14m")
 
+    def test_the_gauge_shows_how_long_the_cap_has_left(self):
+        now = 1000.0
+        line = gov.render(self.cfg(five_hour_cap=50, five_hour_expires_at=now + 5400),
+                          state_at(41.0, now, now + 8040), now)
+        self.assertIn("cap 50% for 1h30m", line)
+
+    def test_an_expired_countdown_is_not_shown(self):
+        now = 1000.0
+        line = gov.render(self.cfg(five_hour_cap=50, five_hour_expires_at=now - 1),
+                          state_at(41.0, now, now + 8040), now)
+        self.assertIn("cap 50%", line)
+        self.assertNotIn("for ", line)
+
     def test_stopped_swaps_the_icon(self):
         now = 1000.0
         line = gov.render(self.cfg(five_hour_cap=50), state_at(55.0, now, now + 60), now)
@@ -637,6 +724,67 @@ class TestCliProcess(Sandboxed):
             proc = self.run_cli("set", value)
             self.assertNotEqual(proc.returncode, 0, value)
         self.assertFalse((self.tmp / "config.json").exists())
+
+    def test_set_for_records_an_expiry(self):
+        self.run_cli("set", "50", "--for", "3h")
+        expires = self.config()["five_hour_expires_at"]
+        self.assertAlmostEqual(expires - time.time(), 3 * 3600, delta=30)
+
+    def test_setting_a_cap_again_without_for_clears_the_expiry(self):
+        self.run_cli("set", "50", "--for", "3h")
+        self.run_cli("set", "60")
+        self.assertIsNone(self.config()["five_hour_expires_at"])
+
+    def test_an_unreadable_duration_writes_nothing(self):
+        proc = self.run_cli("set", "50", "--for", "3")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("cannot read duration", proc.stderr)
+        self.assertFalse((self.tmp / "config.json").exists())
+
+    def test_off_clears_the_expiry_with_the_cap(self):
+        self.run_cli("set", "50", "--for", "3h")
+        self.run_cli("off")
+        self.assertIsNone(self.config()["five_hour_cap"])
+        self.assertIsNone(self.config()["five_hour_expires_at"])
+
+    def test_config_note_leaves_an_expiry_alone(self):
+        # The slash command routes `note` through `config`, not `set`, precisely
+        # so that leaving a note cannot silently drop a running --for.
+        self.run_cli("set", "50", "--for", "3h")
+        before = self.config()["five_hour_expires_at"]
+        self.run_cli("config", "note", "sharing with Ana")
+        self.assertEqual(self.config()["five_hour_expires_at"], before)
+        self.assertEqual(self.config()["note"], "sharing with Ana")
+
+    def test_the_statusline_clears_a_cap_that_has_run_out(self):
+        (self.tmp / "config.json").write_text(json.dumps(dict(
+            gov.DEFAULT_CONFIG, show_tokens=False, five_hour_cap=50,
+            five_hour_expires_at=time.time() - 1)))
+        self.run_cli("statusline", stdin="{}")
+        self.assertIsNone(self.config()["five_hour_cap"])
+        self.assertIsNone(self.config()["five_hour_expires_at"])
+
+    def test_session_start_is_silent_once_the_cap_has_run_out(self):
+        (self.tmp / "config.json").write_text(json.dumps(dict(
+            gov.DEFAULT_CONFIG, five_hour_cap=50,
+            five_hour_expires_at=time.time() - 1)))
+        proc = self.run_cli("session-start", stdin="{}")
+        self.assertEqual(proc.stdout.strip(), "")
+        self.assertIsNone(self.config()["five_hour_cap"])
+
+    def test_an_expired_cap_does_not_halt_the_guard(self):
+        (self.tmp / "config.json").write_text(json.dumps(dict(
+            gov.DEFAULT_CONFIG, five_hour_cap=50,
+            five_hour_expires_at=time.time() - 1)))
+        now = time.time()
+        (self.tmp / "state.json").write_text(json.dumps(state_at(99.0, now, now + 3600)))
+        environ = dict(os.environ, GOVERNOR_HOME=str(self.tmp),
+                       GOVERNOR_TRANSCRIPTS=gov.TRANSCRIPT_GLOB)
+        proc = subprocess.run([sys.executable, str(BIN), "guard", "--event", "PreToolUse"],
+                              input=json.dumps({"tool_name": "Bash",
+                                                "tool_input": {"command": "ls"}}),
+                              capture_output=True, text=True, env=environ, timeout=30)
+        self.assertEqual(proc.stdout.strip(), "")
 
     def test_statusline_persists_state_and_prints_a_gauge(self):
         now = time.time()

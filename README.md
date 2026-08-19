@@ -21,6 +21,7 @@ wanted for the rest of the day.
 /governor weekly 80   same for the weekly window
 /governor status      where do I stand
 /governor log         what has happened - caps set, hit, released
+/governor budget 4M   cap tokens instead of a percentage
 /governor pause       keep the cap, stop enforcing it
 /governor off         drop the cap
 ```
@@ -176,6 +177,35 @@ session-start hook clear an expired cap the next time they run, and `evaluate`
 ignores one that has passed, so the cap stops applying at the moment it expires
 whether or not anything has cleaned it up yet.
 
+## Token budgets
+
+For logins that report no rate-limit utilisation — API key, Bedrock, Vertex —
+there is no percentage to cap. Those sessions can cap absolute tokens instead:
+
+```
+/governor budget 4M          stop me after four million tokens in the window
+/governor budget 20M weekly  same for the week
+/governor budget off         remove it
+```
+
+`4M`, `500k`, `4000000` and `4,000,000` all read the same. The gauge becomes
+`900k/1.0M tok`, and the warnings and the halt speak in tokens rather than
+percentages.
+
+The count comes from the same transcript index as the token counter, so it
+covers every session on the machine, deduplicated by message id. Two caveats,
+both inherent rather than fixable:
+
+- **The window is rolling** when there are no headers — the last five hours from
+  now, not the real window, because nothing tells us when that window began. On
+  a subscription login the count is anchored to the real reset time instead.
+- **It counts what the transcripts recorded.** A session whose transcript is
+  missing or pruned is invisible to it.
+
+Both caps can be set at once; whichever is closer to its limit decides. On a
+subscription login prefer the percentage cap — it is measured against the real
+window rather than reconstructed.
+
 ## History
 
 ```
@@ -209,6 +239,8 @@ of identical lines for a single cap being reached.
 | `seven_day_expires_at` | `null` | same for the weekly cap |
 | `warn_ratio` | `0.8` | warn once past this fraction of the cap |
 | `escalate_ratio` | `0.95` | warn again, louder, this close to the cap |
+| `token_budget` | `null` | absolute tokens allowed per 5h window |
+| `token_budget_weekly` | `null` | same for the week |
 | `mode` | `stop` | `stop` halts the agent, `warn` only tells you |
 | `show_tokens` | `true` | token counter in the status line |
 | `show_weekly` | `auto` | `auto` shows 7d when capped or above 50% |
@@ -227,8 +259,8 @@ Nothing is written inside the plugin — all state lives in `~/.claude/governor/
   is discarded once its own window has expired, so a stale sample can never keep
   the cap engaged forever — it fails open, not shut.
 - **No `rate_limits` block, no percentage cap.** API-key, Bedrock and Vertex
-  users do not get those headers; the gauge shows `5h —` and only the token
-  counter works.
+  users do not get those headers; the gauge shows `5h —` and the percentage cap
+  has nothing to measure. Use [token budgets](#token-budgets) there.
 
 ## Development
 

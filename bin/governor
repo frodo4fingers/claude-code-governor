@@ -56,6 +56,8 @@ DEFAULT_CONFIG = {
     "seven_day_cap": None,      # same for the weekly window
     "five_hour_expires_at": None,   # unix time the 5h cap releases itself, or None
     "seven_day_expires_at": None,   # same for the weekly cap
+    "token_budget": None,       # absolute tokens per 5h window, for transports
+    "token_budget_weekly": None,    # that report no rate-limit utilisation
     "warn_ratio": 0.8,          # warn once you pass warn_ratio * cap
     "escalate_ratio": 0.95,     # warn again, louder, this close to the cap
     "mode": "stop",             # "stop" = halt the agent, "warn" = only tell you
@@ -260,13 +262,46 @@ def expire_caps(cfg: dict, now: float | None = None) -> bool:
     return changed
 
 
-def evaluate(cfg: dict, state: dict, now: float | None = None) -> dict:
-    """Decide what the caps say right now: allow / warn / stop."""
+BUDGET_FIELDS = (("five_hour", "token_budget"),
+                 ("seven_day", "token_budget_weekly"))
+
+
+def window_start(state: dict, now: float, key: str = "five_hour") -> float:
+    """When the current window began.
+
+    Anchored to the real reset time when the headers gave us one. Without them
+    the window is a rolling one - the honest best available, and the reason a
+    token budget is a weaker instrument than a percentage cap.
+    """
+    span = FIVE_HOURS if key == "five_hour" else SEVEN_DAYS
+    sample = read_limit(state, key, now)
+    if sample and sample["resets_at"]:
+        return float(sample["resets_at"]) - span
+    return now - span
+
+
+def current_tokens(state: dict, now: float | None = None, budget_s: float = 0.35) -> dict:
+    now = time.time() if now is None else now
+    idx = index_update(budget_s=budget_s, now=now)
+    return {key: tokens_since(window_start(state, now, key), idx)
+            for key in ("five_hour", "seven_day")}
+
+
+def evaluate(cfg: dict, state: dict, now: float | None = None,
+             tokens: dict | None = None) -> dict:
+    """Decide what the caps say right now: allow / warn / stop.
+
+    `tokens` is optional so that the hot path can decide whether to pay for it:
+    counting is only needed when a token budget is configured.
+    """
     now = time.time() if now is None else now
     verdict = {"action": "allow", "key": None, "pct": None, "cap": None,
-               "resets_at": None, "expires_at": None, "tier": None}
+               "resets_at": None, "expires_at": None, "tier": None,
+               "source": None, "used": None, "budget": None}
     if not cfg.get("enabled", True):
         return verdict
+
+    candidates = []
     for key, cap_field, expiry_field in CAP_FIELDS:
         cap = cfg.get(cap_field)
         if cap is None:
@@ -277,13 +312,32 @@ def evaluate(cfg: dict, state: dict, now: float | None = None) -> dict:
         sample = read_limit(state, key, now)
         if sample is None:
             continue
-        cap = float(cap)
-        pct = sample["pct"]
-        warn_ratio = float(cfg.get("warn_ratio", 0.8))
-        escalate_ratio = float(cfg.get("escalate_ratio", 0.95))
-        # An escalation that is not strictly above the first warning cannot be
-        # reached without swallowing it, so in that case there is no second tier.
-        escalates = escalate_ratio > warn_ratio
+        candidates.append({"key": key, "pct": sample["pct"], "cap": float(cap),
+                           "resets_at": sample["resets_at"], "age": sample["age"],
+                           "expires_at": expires_at, "source": "window",
+                           "used": None, "budget": None})
+
+    for key, budget_field in BUDGET_FIELDS:
+        budget = cfg.get(budget_field)
+        if budget is None or not tokens:
+            continue
+        used = tokens.get(key)
+        if used is None or float(budget) <= 0:
+            continue
+        budget = float(budget)
+        candidates.append({"key": key, "pct": used / budget * 100.0, "cap": 100.0,
+                           "resets_at": None, "age": None, "expires_at": None,
+                           "source": "tokens", "used": int(used), "budget": budget})
+
+    warn_ratio = float(cfg.get("warn_ratio", 0.8))
+    escalate_ratio = float(cfg.get("escalate_ratio", 0.95))
+    # An escalation that is not strictly above the first warning cannot be
+    # reached without swallowing it, so in that case there is no second tier.
+    escalates = escalate_ratio > warn_ratio
+    rank = {"allow": 0, "warn": 1, "final": 2, "stop": 3}
+
+    for candidate in candidates:
+        pct, cap = candidate["pct"], candidate["cap"]
         if pct >= cap:
             action, tier = "stop", "stop"
         elif escalates and pct >= cap * escalate_ratio:
@@ -292,11 +346,8 @@ def evaluate(cfg: dict, state: dict, now: float | None = None) -> dict:
             action, tier = "warn", "warn"
         else:
             continue
-        rank = {"allow": 0, "warn": 1, "final": 2, "stop": 3}
         if rank[tier] > rank[verdict["tier"] or "allow"]:
-            verdict = {"action": action, "key": key, "pct": pct, "cap": cap,
-                       "resets_at": sample["resets_at"], "age": sample["age"],
-                       "expires_at": expires_at, "tier": tier}
+            verdict = dict(candidate, action=action, tier=tier)
     return verdict
 
 
@@ -467,17 +518,26 @@ def tone(pct: float, cap: float | None, warn_ratio: float) -> str:
     return "38;5;114"
 
 
-def render(cfg: dict, state: dict, now: float | None = None) -> str:
+def render(cfg: dict, state: dict, now: float | None = None,
+           tokens: dict | None = None) -> str:
     now = time.time() if now is None else now
     warn_ratio = float(cfg.get("warn_ratio", 0.8))
     cap = cfg.get("five_hour_cap")
     cap = float(cap) if cap is not None else None
     sample = read_limit(state, "five_hour", now)
-    stopped = evaluate(cfg, state, now)["action"] == "stop" and cfg.get("mode", "stop") == "stop"
+    budgeted = any(cfg.get(field) is not None for _key, field in BUDGET_FIELDS)
+    if tokens is None and (cfg.get("show_tokens", True) or budgeted):
+        try:
+            tokens = current_tokens(state, now)
+        except Exception:      # never let bookkeeping break the status line
+            tokens = None
+    stopped = (evaluate(cfg, state, now, tokens)["action"] == "stop"
+               and cfg.get("mode", "stop") == "stop")
     segments = []
 
     if sample is None:
-        segments.append(_c("38;5;245", "⛽ 5h —"))
+        icon = _c("38;5;203", "⛔") if stopped else "⛽"
+        segments.append(f"{icon} " + _c("38;5;245", "5h —"))
     else:
         pct = sample["pct"]
         colour = tone(pct, cap, warn_ratio)
@@ -502,16 +562,16 @@ def render(cfg: dict, state: dict, now: float | None = None) -> str:
         wcap = float(wcap) if wcap is not None else None
         segments.append(_c(tone(weekly["pct"], wcap, warn_ratio), f"7d {weekly['pct']:.0f}%"))
 
-    if cfg.get("show_tokens", True):
-        try:
-            idx = index_update(now=now)
-            if sample and sample["resets_at"]:
-                start = float(sample["resets_at"]) - FIVE_HOURS
-            else:
-                start = now - FIVE_HOURS
-            segments.append(_c("38;5;245", f"{fmt_tokens(tokens_since(start, idx))} tok"))
-        except Exception:  # never let bookkeeping break the status line
-            pass
+    if cfg.get("show_tokens", True) and tokens is not None:
+        used = tokens["five_hour"]
+        budget = cfg.get("token_budget")
+        if budget:
+            label = f"{fmt_tokens(used)}/{fmt_tokens(int(budget))} tok"
+            colour = tone(used / float(budget) * 100.0, 100.0, warn_ratio)
+        else:
+            label = f"{fmt_tokens(used)} tok"
+            colour = "38;5;245"
+        segments.append(_c(colour, label))
 
     if cfg.get("enabled", True) is False and cfg.get("five_hour_cap") is not None:
         segments.append(_c("38;5;245", "cap paused"))
@@ -524,8 +584,13 @@ def render(cfg: dict, state: dict, now: float | None = None) -> str:
 def stop_message(verdict: dict, cfg: dict, now: float | None = None) -> str:
     now = time.time() if now is None else now
     window = "5h window" if verdict["key"] == "five_hour" else "weekly window"
-    lines = [f"governor: {window} at {verdict['pct']:.1f}%, your cap is {verdict['cap']:.0f}%. "
-             f"Stopping here so the rest stays available."]
+    if verdict.get("source") == "tokens":
+        lines = [f"governor: {window} at {fmt_tokens(int(verdict['used']))} of your "
+                 f"{fmt_tokens(int(verdict['budget']))} token budget. "
+                 f"Stopping here so the rest stays available."]
+    else:
+        lines = [f"governor: {window} at {verdict['pct']:.1f}%, your cap is "
+                 f"{verdict['cap']:.0f}%. Stopping here so the rest stays available."]
     if verdict.get("resets_at"):
         lines.append(f"Window resets in {fmt_duration(float(verdict['resets_at']) - now)} "
                      f"({time.strftime('%H:%M', time.localtime(float(verdict['resets_at'])))}).")
@@ -535,7 +600,11 @@ def stop_message(verdict: dict, cfg: dict, now: float | None = None) -> str:
     if cfg.get("note"):
         note = str(cfg["note"]).strip()
         lines.append(note if note.endswith((".", "!", "?")) else note + ".")
-    lines.append("Lift it with /governor off, or raise it with /governor <percent>.")
+    if verdict.get("source") == "tokens":
+        lines.append("Lift it with /governor budget off, or raise it with "
+                     "/governor budget <count>.")
+    else:
+        lines.append("Lift it with /governor off, or raise it with /governor <percent>.")
     return " ".join(lines)
 
 
@@ -545,6 +614,14 @@ def warn_message(verdict: dict, now: float | None = None) -> str:
     tail = ""
     if verdict.get("resets_at"):
         tail = f", resets in {fmt_duration(float(verdict['resets_at']) - now)}"
+    if verdict.get("source") == "tokens":
+        used, budget = int(verdict["used"]), int(verdict["budget"])
+        if verdict.get("tier") == "final":
+            return (f"governor: {window} {fmt_tokens(used)} spent, "
+                    f"{fmt_tokens(budget - used)} left of your {fmt_tokens(budget)} token "
+                    f"budget. The next turn may reach it - finish up, or raise it now.")
+        return (f"governor: {window} {fmt_tokens(used)} of your {fmt_tokens(budget)} token "
+                f"budget. Work will stop at the budget.")
     if verdict.get("tier") == "final":
         # Close enough that one large turn can cross it, so the number that
         # matters is the room left, not the percentage already spent.
@@ -559,7 +636,7 @@ def warn_message(verdict: dict, now: float | None = None) -> str:
 # --------------------------------------------------------------------------- guard
 
 SUBCOMMANDS = ("status", "set", "off", "on", "pause", "config", "index", "log",
-               "install", "uninstall", "guard", "statusline", "session-start")
+               "budget", "install", "uninstall", "guard", "statusline", "session-start")
 # Matches the binary however it is spelled - bare name, absolute path, ~ path,
 # quoted - as long as one of our subcommands follows it.
 SELF_CALL_RE = re.compile(
@@ -607,7 +684,12 @@ def log_stop_once(verdict: dict, now: float | None = None) -> bool:
     data = _read_json(WARN_PATH, {}) or {}
     if data.get("logged_stop") == marker:
         return False
-    log_event("stop", now=now, key=verdict["key"], pct=verdict["pct"], cap=verdict["cap"])
+    if verdict.get("source") == "tokens":
+        log_event("stop", now=now, key=verdict["key"], source="tokens",
+                  used=verdict["used"], budget=verdict["budget"])
+    else:
+        log_event("stop", now=now, key=verdict["key"],
+                  pct=verdict["pct"], cap=verdict["cap"])
     data["logged_stop"] = marker
     _write_json(WARN_PATH, data)
     return True
@@ -621,13 +703,21 @@ def cmd_guard(args) -> int:
     cfg = load_config()
     if not cfg.get("enabled", True):
         return 0
-    if cfg.get("five_hour_cap") is None and cfg.get("seven_day_cap") is None:
+    if all(cfg.get(field) is None
+           for field in ("five_hour_cap", "seven_day_cap",
+                         "token_budget", "token_budget_weekly")):
         return 0
     if is_self_call(event, payload):
         return 0
 
     state = _read_json(STATE_PATH, {}) or {}
-    verdict = evaluate(cfg, state)
+    tokens = None
+    if any(cfg.get(field) is not None for _key, field in BUDGET_FIELDS):
+        try:
+            tokens = current_tokens(state)
+        except Exception:
+            tokens = None
+    verdict = evaluate(cfg, state, tokens=tokens)
     if verdict["action"] == "stop":
         log_stop_once(verdict)
 
@@ -751,6 +841,40 @@ def cmd_set(args) -> int:
     return cmd_status(args)
 
 
+_TOKENS_RE = re.compile(r"^(\d+(?:\.\d+)?)([km]?)$")
+
+
+def _parse_tokens(text: str) -> int:
+    raw = "".join(str(text).split()).lower().replace(",", "").replace("_", "")
+    match = _TOKENS_RE.match(raw)
+    if not match:
+        raise ValueError(f"cannot read token count {text!r} - try 4M, 500k or 4000000")
+    value = float(match.group(1)) * {"": 1, "k": 1_000, "m": 1_000_000}[match.group(2)]
+    if value <= 0:
+        raise ValueError("token budget must be positive")
+    return int(value)
+
+
+def cmd_budget(args) -> int:
+    cfg = load_config()
+    field = "token_budget_weekly" if args.weekly else "token_budget"
+    key = "seven_day" if args.weekly else "five_hour"
+    if str(args.amount).strip().lower() in ("off", "none", "null", "0"):
+        if cfg.get(field) is not None:
+            log_event("budget_off", key=key, budget=cfg[field])
+        cfg[field] = None
+    else:
+        try:
+            cfg[field] = _parse_tokens(args.amount)
+        except ValueError as exc:
+            print(f"governor: {exc}", file=sys.stderr)
+            return 1
+        log_event("budget", key=key, budget=cfg[field])
+    cfg["enabled"] = True
+    save_config(cfg)
+    return cmd_status(args)
+
+
 def cmd_off(args) -> int:
     cfg = load_config()
     if args.weekly:
@@ -828,22 +952,20 @@ def cmd_status(args) -> int:
     if expire_caps(cfg, now):
         save_config(cfg)
     state = _read_json(STATE_PATH, {}) or {}
-    verdict = evaluate(cfg, state, now)
     five = read_limit(state, "five_hour", now)
     seven = read_limit(state, "seven_day", now)
     tokens = None
     try:
-        idx = index_update(budget_s=1.5, now=now)
-        start = (float(five["resets_at"]) - FIVE_HOURS
-                 if five and five["resets_at"] else now - FIVE_HOURS)
-        tokens = tokens_since(start, idx)
+        tokens = current_tokens(state, now, budget_s=1.5)
     except Exception:
         pass
+    verdict = evaluate(cfg, state, now, tokens)
 
     if getattr(args, "json", False):
         print(json.dumps({
             "config": cfg, "verdict": verdict, "five_hour": five, "seven_day": seven,
-            "tokens_in_window": tokens, "state_age_s": now - float(state.get("updated_at") or 0),
+            "tokens_in_window": (tokens or {}).get("five_hour"), "tokens": tokens,
+            "state_age_s": now - float(state.get("updated_at") or 0),
         }, indent=2, default=str))
         return 0
 
@@ -869,7 +991,14 @@ def cmd_status(args) -> int:
             line += f"   resets in {fmt_duration(float(seven['resets_at']) - now)}"
         print(line)
     if tokens is not None:
-        print(f"  tokens      {fmt_tokens(tokens)} in the current 5h window")
+        budget = cfg.get("token_budget")
+        suffix = f" of a {fmt_tokens(int(budget))} budget" if budget else ""
+        print(f"  tokens      {fmt_tokens(tokens['five_hour'])}{suffix} "
+              f"in the current 5h window")
+        wbudget = cfg.get("token_budget_weekly")
+        if wbudget:
+            print(f"  tokens 7d   {fmt_tokens(tokens['seven_day'])} of a "
+                  f"{fmt_tokens(int(wbudget))} budget")
     if cfg.get("note"):
         print(f"  note        {cfg['note']}")
     print(f"  verdict     {verdict['action']}")
@@ -894,18 +1023,25 @@ def cmd_log(args) -> int:
         key = window.get(record.get("key"), record.get("key") or "")
         cap = record.get("cap")
         event = record.get("event", "?")
-        if event == "stop":
+        if event == "stop" and record.get("source") == "tokens":
+            detail = (f"{fmt_tokens(int(record.get('used') or 0))} used, "
+                      f"budget {fmt_tokens(int(record.get('budget') or 0))}")
+        elif event == "stop":
             detail = f"{record.get('pct', 0):.1f}% used, cap {float(cap):.0f}%"
         elif event == "set":
             detail = f"cap {float(cap):.0f}%"
             if record.get("expires_at"):
                 detail += (" until "
                            + time.strftime("%H:%M", time.localtime(float(record["expires_at"]))))
+        elif event in ("budget", "budget_off"):
+            detail = f"budget {fmt_tokens(int(record.get('budget') or 0))}"
+            if event == "budget_off":
+                detail += " removed"
         elif event in ("off", "expired"):
             detail = f"cap {float(cap):.0f}% removed" if cap is not None else "cap removed"
         else:
             detail = ""
-        print(f"  {when}  {event:<8} {key:<3} {detail}".rstrip())
+        print(f"  {when}  {event:<10} {key:<3} {detail}".rstrip())
 
     stops = sum(1 for r in records if r.get("event") == "stop")
     print(f"\n  {len(records)} entries, {stops} halt{'' if stops == 1 else 's'}")
@@ -1124,6 +1260,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--note", default=None, help="reminder shown when the cap fires")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_set)
+
+    p = sub.add_parser("budget", help="cap yourself at N tokens per window instead")
+    p.add_argument("amount", help="4M, 500k, 4000000, or off")
+    p.add_argument("--weekly", action="store_true", help="budget the 7d window instead")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_budget)
 
     p = sub.add_parser("off", help="remove the cap")
     p.add_argument("--weekly", action="store_true")

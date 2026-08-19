@@ -1,6 +1,6 @@
 ---
 description: Cap your share of the Claude Code usage window, or inspect where you stand
-argument-hint: "[50 | 50 for 3h | weekly 80 | off | pause | on | status | log]"
+argument-hint: "[50 | 50 for 3h | weekly 80 | budget 4M | off | status | log]"
 allowed-tools: Bash(python3:*)
 ---
 
@@ -21,6 +21,9 @@ Translate them like this:
 | `50 for 3h`             | `set 50 --for 3h`                      |
 | `weekly 80 for 2d`      | `set 80 --weekly --for 2d`             |
 | `weekly 80`             | `set 80 --weekly`                      |
+| `budget 4M`             | `budget 4M`                            |
+| `budget 20M weekly`     | `budget 20M --weekly`                  |
+| `budget off`            | `budget off`                           |
 | `off`                   | `off`                                  |
 | `off all`               | `off --all`                            |
 | `log`                   | `log`                                  |
@@ -30,12 +33,17 @@ Translate them like this:
 | `on`                    | `on`                                   |
 | `note <text>`           | `config note "<text>"`                 |
 | `warn 0.9`              | `config warn_ratio 0.9`                |
+| `escalate 0.95`         | `config escalate_ratio 0.95`           |
 | `mode warn` / `mode stop` | `config mode warn` / `config mode stop` |
 | `install` / `uninstall` | `install` / `uninstall`                |
 | anything else           | `status`, and say the argument was not understood |
 
 A cap is a percentage of the usage window, not of your remaining budget:
 `/governor 50` means "stop me once the 5-hour window is half spent".
+
+`budget` caps absolute tokens instead of a percentage. It is for logins that
+report no rate-limit utilisation (API key, Bedrock, Vertex); on a subscription
+prefer the percentage cap, which is measured against the real window.
 
 `for <duration>` makes the cap release itself after that long - `3h`, `90m`,
 `2h30m`, `2d`. A bare number is not a duration; if the user writes `for 3`, ask

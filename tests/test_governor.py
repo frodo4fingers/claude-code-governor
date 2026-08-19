@@ -355,6 +355,103 @@ class TestExpiringCaps(unittest.TestCase):
         self.assertIn("lifts itself in 1h30m", text)
 
 
+class TestParseTokens(unittest.TestCase):
+    def test_accepted_forms(self):
+        for text, count in [("4M", 4_000_000), ("500k", 500_000), ("4000000", 4_000_000),
+                            ("1.5M", 1_500_000), ("4,000,000", 4_000_000),
+                            ("4_000_000", 4_000_000), (" 2m ", 2_000_000)]:
+            self.assertEqual(gov._parse_tokens(text), count, text)
+
+    def test_rejects(self):
+        for text in ("", "abc", "-5", "4g", "4MB", "1.2.3"):
+            with self.assertRaises(ValueError, msg=text):
+                gov._parse_tokens(text)
+
+
+class TestWindowStart(unittest.TestCase):
+    def test_anchored_to_the_real_reset_when_headers_gave_one(self):
+        now = 1_000_000.0
+        state = state_at(41.0, now, now + 3600)
+        self.assertEqual(gov.window_start(state, now), now + 3600 - gov.FIVE_HOURS)
+
+    def test_rolling_when_there_is_no_sample(self):
+        now = 1_000_000.0
+        self.assertEqual(gov.window_start({}, now), now - gov.FIVE_HOURS)
+
+    def test_weekly_span(self):
+        now = 1_000_000.0
+        self.assertEqual(gov.window_start({}, now, "seven_day"), now - gov.SEVEN_DAYS)
+
+
+class TestTokenBudget(unittest.TestCase):
+    def verdict(self, used, now=1000.0, state=None, **cfg):
+        base = dict(gov.DEFAULT_CONFIG)
+        base.update(cfg)
+        return gov.evaluate(base, state if state is not None else {}, now,
+                            {"five_hour": used, "seven_day": used})
+
+    def test_under_budget(self):
+        self.assertEqual(self.verdict(500_000, token_budget=1_000_000)["action"], "allow")
+
+    def test_warn_band(self):
+        v = self.verdict(850_000, token_budget=1_000_000)
+        self.assertEqual((v["action"], v["tier"], v["source"]), ("warn", "warn", "tokens"))
+
+    def test_final_band(self):
+        self.assertEqual(self.verdict(960_000, token_budget=1_000_000)["tier"], "final")
+
+    def test_at_the_budget(self):
+        v = self.verdict(1_000_000, token_budget=1_000_000)
+        self.assertEqual(v["action"], "stop")
+        self.assertEqual(v["used"], 1_000_000)
+        self.assertEqual(v["budget"], 1_000_000)
+
+    def test_no_budget_means_no_opinion(self):
+        self.assertEqual(self.verdict(9_000_000)["action"], "allow")
+
+    def test_no_count_means_no_opinion(self):
+        cfg = dict(gov.DEFAULT_CONFIG, token_budget=1_000)
+        self.assertEqual(gov.evaluate(cfg, {}, 1000.0, None)["action"], "allow")
+
+    def test_a_zero_budget_is_ignored_rather_than_always_stopping(self):
+        self.assertEqual(self.verdict(1, token_budget=0)["action"], "allow")
+
+    def test_the_weekly_budget_is_separate(self):
+        v = self.verdict(600_000, token_budget=None, token_budget_weekly=500_000)
+        self.assertEqual((v["action"], v["key"]), ("stop", "seven_day"))
+
+    def test_a_percentage_cap_and_a_budget_coexist(self):
+        now = 1000.0
+        v = self.verdict(100, now=now, state=state_at(60.0, now, now + 3600),
+                         five_hour_cap=50, token_budget=1_000_000)
+        self.assertEqual((v["action"], v["source"]), ("stop", "window"))
+
+    def test_the_stricter_of_the_two_wins(self):
+        now = 1000.0
+        v = self.verdict(1_000_000, now=now, state=state_at(41.0, now, now + 3600),
+                         five_hour_cap=50, token_budget=1_000_000)
+        self.assertEqual((v["tier"], v["source"]), ("stop", "tokens"))
+
+    def test_disabled_config_ignores_budgets(self):
+        self.assertEqual(self.verdict(9_000_000, token_budget=1_000,
+                                      enabled=False)["action"], "allow")
+
+    def test_the_halt_message_speaks_tokens(self):
+        v = self.verdict(1_200_000, token_budget=1_000_000)
+        text = gov.stop_message(v, dict(gov.DEFAULT_CONFIG), 1000.0)
+        self.assertIn("1.2M of your 1.0M token budget", text)
+        self.assertIn("/governor budget off", text)
+        self.assertNotIn("<percent>", text)
+
+    def test_the_warning_speaks_tokens(self):
+        v = self.verdict(850_000, token_budget=1_000_000)
+        self.assertIn("850k of your 1.0M token budget", gov.warn_message(v, 1000.0))
+
+    def test_the_final_warning_counts_tokens_left(self):
+        v = self.verdict(960_000, token_budget=1_000_000)
+        self.assertIn("40k left", gov.warn_message(v, 1000.0))
+
+
 # ------------------------------------------------------------------ formatting
 
 class TestFormatting(unittest.TestCase):
@@ -685,6 +782,18 @@ class TestRender(Sandboxed):
                          weekly={"used_percentage": 12.0, "resets_at": now + 86400})
         self.assertIn("7d 12%", gov.render(self.cfg(show_weekly="always"), state, now))
 
+    def test_the_gauge_shows_the_budget(self):
+        line = gov.render(dict(gov.DEFAULT_CONFIG, token_budget=1_000_000), {}, 1000.0,
+                          tokens={"five_hour": 900_000, "seven_day": 900_000})
+        self.assertIn("900k/1.0M tok", line)
+
+    def test_the_gauge_stops_without_any_rate_limit_headers(self):
+        # A token budget exists precisely for transports that send no headers,
+        # so the placeholder gauge still has to show that work has halted.
+        line = gov.render(dict(gov.DEFAULT_CONFIG, token_budget=800_000), {}, 1000.0,
+                          tokens={"five_hour": 900_000, "seven_day": 900_000})
+        self.assertTrue(line.startswith("⛔"), line)
+
     def test_paused_cap_is_labelled(self):
         now = 1000.0
         line = gov.render(self.cfg(five_hour_cap=50, enabled=False),
@@ -729,6 +838,17 @@ class TestGuardProcess(Sandboxed):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         out = proc.stdout.strip()
         return json.loads(out) if out else None
+
+    def write_transcript(self, tokens, count=9):
+        project = self.projects / "proj"
+        project.mkdir(exist_ok=True)
+        now = time.time()
+        with open(project / "a.jsonl", "w", encoding="utf-8") as fh:
+            for i in range(count):
+                fh.write(json.dumps({
+                    "type": "assistant", "timestamp": iso(now - 600),
+                    "message": {"id": f"msg_{i:016d}",
+                                "usage": {"input_tokens": tokens // count}}}) + "\n")
 
     def arm(self, pct=60.0, **cfg):
         now = time.time()
@@ -790,6 +910,42 @@ class TestGuardProcess(Sandboxed):
         self.arm(mode="warn")
         self.run_guard({"tool_name": "Bash", "tool_input": {"command": "ls"}})
         self.assertEqual([r["event"] for r in gov.read_log()], ["stop"])
+
+    def test_a_token_budget_halts_without_any_rate_limit_sample(self):
+        self.write_transcript(900_000)
+        (self.tmp / "config.json").write_text(json.dumps(
+            dict(gov.DEFAULT_CONFIG, token_budget=800_000)))
+        out = self.run_guard({"tool_name": "Bash", "tool_input": {"command": "ls"}})
+        self.assertEqual(out["continue"], False)
+        self.assertIn("token budget", out["stopReason"])
+
+    def test_a_token_stop_is_logged_in_tokens(self):
+        self.write_transcript(900_000)
+        (self.tmp / "config.json").write_text(json.dumps(
+            dict(gov.DEFAULT_CONFIG, token_budget=800_000)))
+        self.run_guard({"tool_name": "Bash", "tool_input": {"command": "ls"}})
+        record = [r for r in gov.read_log() if r["event"] == "stop"][0]
+        self.assertEqual((record["used"], record["budget"], record["source"]),
+                         (900_000, 800_000, "tokens"))
+
+    def test_the_index_is_only_built_when_a_budget_needs_it(self):
+        # The guard runs before every tool call. Counting tokens unconditionally
+        # would put the index on the hot path for everyone.
+        self.write_transcript(900_000)
+        self.arm()                                     # percentage cap, no budget
+        self.run_guard({"tool_name": "Bash", "tool_input": {"command": "ls"}})
+        self.assertFalse((self.tmp / "index.json").exists())
+        (self.tmp / "config.json").write_text(json.dumps(
+            dict(gov.DEFAULT_CONFIG, token_budget=800_000)))
+        self.run_guard({"tool_name": "Bash", "tool_input": {"command": "ls"}})
+        self.assertTrue((self.tmp / "index.json").exists())
+
+    def test_a_budget_under_the_count_still_allows(self):
+        self.write_transcript(100_000)
+        (self.tmp / "config.json").write_text(json.dumps(
+            dict(gov.DEFAULT_CONFIG, token_budget=800_000)))
+        self.assertIsNone(self.run_guard({"tool_name": "Bash",
+                                          "tool_input": {"command": "ls"}}))
 
     def test_no_cap_is_a_no_op(self):
         (self.tmp / "config.json").write_text(json.dumps(dict(gov.DEFAULT_CONFIG)))
@@ -929,6 +1085,27 @@ class TestCliProcess(Sandboxed):
                                                 "tool_input": {"command": "ls"}}),
                               capture_output=True, text=True, env=environ, timeout=30)
         self.assertEqual(proc.stdout.strip(), "")
+
+    def test_budget_round_trip(self):
+        self.run_cli("budget", "4M")
+        self.assertEqual(self.config()["token_budget"], 4_000_000)
+        self.run_cli("budget", "20M", "--weekly")
+        self.assertEqual(self.config()["token_budget_weekly"], 20_000_000)
+        self.run_cli("budget", "off")
+        self.assertIsNone(self.config()["token_budget"])
+        self.assertEqual(self.config()["token_budget_weekly"], 20_000_000)
+
+    def test_an_unreadable_budget_writes_nothing(self):
+        proc = self.run_cli("budget", "4GB")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("cannot read token count", proc.stderr)
+        self.assertFalse((self.tmp / "config.json").exists())
+
+    def test_budget_changes_are_recorded(self):
+        self.run_cli("budget", "4M")
+        self.run_cli("budget", "off")
+        events = [r["event"] for r in json.loads(self.run_cli("log", "--json").stdout)]
+        self.assertEqual(events, ["budget", "budget_off"])
 
     def test_cap_changes_are_recorded(self):
         self.run_cli("set", "50")

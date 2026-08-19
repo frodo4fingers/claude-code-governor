@@ -241,6 +241,35 @@ class TestEvaluate(unittest.TestCase):
         stale = state_at(99.0, now - gov.FIVE_HOURS - 1)
         self.assertEqual(gov.evaluate(cfg, stale, now)["action"], "allow")
 
+    def test_tiers(self):
+        for pct, action, tier in [(39.0, "allow", None), (40.0, "warn", "warn"),
+                                  (47.4, "warn", "warn"), (47.5, "warn", "final"),
+                                  (49.9, "warn", "final"), (50.0, "stop", "stop")]:
+            v = self.verdict(pct, five_hour_cap=50)
+            self.assertEqual((v["action"], v["tier"]), (action, tier), pct)
+
+    def test_an_escalation_below_the_first_warning_is_switched_off(self):
+        # It cannot be reached without swallowing the first warning, so the
+        # second tier simply does not exist for that config - warnings stay
+        # warnings all the way to the cap.
+        cfg = dict(five_hour_cap=50, warn_ratio=0.8, escalate_ratio=0.5)
+        self.assertEqual(self.verdict(30.0, **cfg)["action"], "allow")
+        self.assertEqual(self.verdict(41.0, **cfg)["tier"], "warn")
+        self.assertEqual(self.verdict(49.9, **cfg)["tier"], "warn")
+
+    def test_an_escalation_equal_to_the_first_warning_is_switched_off(self):
+        cfg = dict(five_hour_cap=50, warn_ratio=0.8, escalate_ratio=0.8)
+        self.assertEqual(self.verdict(49.9, **cfg)["tier"], "warn")
+
+    def test_a_final_warning_outranks_a_first_one_in_another_window(self):
+        now = 1000.0
+        cfg = dict(gov.DEFAULT_CONFIG, five_hour_cap=50, seven_day_cap=60)
+        state = state_at(41.0, now - 10, now + 3600,          # 5h: plain warn
+                         weekly={"used_percentage": 58.0,      # 7d: final warn
+                                 "resets_at": now + 86400})
+        v = gov.evaluate(cfg, state, now)
+        self.assertEqual((v["tier"], v["key"]), ("final", "seven_day"))
+
     def test_worst_window_wins(self):
         now = 1000.0
         cfg = dict(gov.DEFAULT_CONFIG, five_hour_cap=50, seven_day_cap=60)
@@ -399,9 +428,39 @@ class TestMessages(unittest.TestCase):
         self.assertIn("5h usage 45.0% of your 55% cap", text)
         self.assertIn("resets in 2h14m", text)
 
+    def test_final_warning_counts_the_room_left(self):
+        v = dict(self.verdict, action="warn", tier="final", pct=53.5, cap=55.0)
+        text = gov.warn_message(v, self.now)
+        self.assertIn("1.5 points under your 55% cap", text)
+        self.assertIn("The next turn may reach it", text)
+
+    def test_first_warning_keeps_the_plain_wording(self):
+        v = dict(self.verdict, action="warn", tier="warn", pct=45.0)
+        self.assertIn("Work will stop at the cap.", gov.warn_message(v, self.now))
+
     def test_weekly_wording(self):
         v = dict(self.verdict, key="seven_day")
         self.assertIn("weekly window", gov.stop_message(v, dict(gov.DEFAULT_CONFIG), self.now))
+
+
+class TestWarnThrottle(Sandboxed):
+    def test_the_same_tier_is_throttled(self):
+        self.assertTrue(gov.throttled_warn("warn", now=1000.0))
+        self.assertFalse(gov.throttled_warn("warn", now=1010.0))
+
+    def test_the_interval_eventually_lapses(self):
+        gov.throttled_warn("warn", now=1000.0)
+        self.assertTrue(gov.throttled_warn("warn", now=1400.0))
+
+    def test_a_change_of_tier_is_never_held_back(self):
+        # Escalation delivered after the halt it was meant to precede is useless.
+        gov.throttled_warn("warn", now=1000.0)
+        self.assertTrue(gov.throttled_warn("final", now=1001.0))
+
+    def test_the_new_tier_then_throttles_on_its_own(self):
+        gov.throttled_warn("warn", now=1000.0)
+        gov.throttled_warn("final", now=1001.0)
+        self.assertFalse(gov.throttled_warn("final", now=1002.0))
 
 
 # ---------------------------------------------------------------- token index
@@ -646,6 +705,17 @@ class TestGuardProcess(Sandboxed):
         self.assertIn("systemMessage", first)
         self.assertIsNone(self.run_guard({"tool_name": "Bash",
                                           "tool_input": {"command": "ls"}}))
+
+    def test_escalation_reaches_the_session_immediately(self):
+        # First warning at 41%, then 48.5% crosses escalate_ratio well inside the
+        # 300s throttle window. The second message must still get through.
+        self.arm(pct=41.0)
+        first = self.run_guard({"tool_name": "Bash", "tool_input": {"command": "ls"}})
+        self.assertIn("Work will stop at the cap", first["systemMessage"])
+        now = time.time()
+        (self.tmp / "state.json").write_text(json.dumps(state_at(48.5, now, now + 3600)))
+        second = self.run_guard({"tool_name": "Bash", "tool_input": {"command": "ls"}})
+        self.assertIn("points under your 50% cap", second["systemMessage"])
 
     def test_no_cap_is_a_no_op(self):
         (self.tmp / "config.json").write_text(json.dumps(dict(gov.DEFAULT_CONFIG)))

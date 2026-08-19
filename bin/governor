@@ -54,6 +54,7 @@ DEFAULT_CONFIG = {
     "five_hour_expires_at": None,   # unix time the 5h cap releases itself, or None
     "seven_day_expires_at": None,   # same for the weekly cap
     "warn_ratio": 0.8,          # warn once you pass warn_ratio * cap
+    "escalate_ratio": 0.95,     # warn again, louder, this close to the cap
     "mode": "stop",             # "stop" = halt the agent, "warn" = only tell you
     "show_tokens": True,        # add a token counter for the current window
     "show_weekly": "auto",      # auto | always | never
@@ -204,7 +205,7 @@ def evaluate(cfg: dict, state: dict, now: float | None = None) -> dict:
     """Decide what the caps say right now: allow / warn / stop."""
     now = time.time() if now is None else now
     verdict = {"action": "allow", "key": None, "pct": None, "cap": None,
-               "resets_at": None, "expires_at": None}
+               "resets_at": None, "expires_at": None, "tier": None}
     if not cfg.get("enabled", True):
         return verdict
     for key, cap_field, expiry_field in CAP_FIELDS:
@@ -219,17 +220,24 @@ def evaluate(cfg: dict, state: dict, now: float | None = None) -> dict:
             continue
         cap = float(cap)
         pct = sample["pct"]
+        warn_ratio = float(cfg.get("warn_ratio", 0.8))
+        escalate_ratio = float(cfg.get("escalate_ratio", 0.95))
+        # An escalation that is not strictly above the first warning cannot be
+        # reached without swallowing it, so in that case there is no second tier.
+        escalates = escalate_ratio > warn_ratio
         if pct >= cap:
-            action = "stop"
-        elif pct >= cap * float(cfg.get("warn_ratio", 0.8)):
-            action = "warn"
+            action, tier = "stop", "stop"
+        elif escalates and pct >= cap * escalate_ratio:
+            action, tier = "warn", "final"
+        elif pct >= cap * warn_ratio:
+            action, tier = "warn", "warn"
         else:
             continue
-        rank = {"allow": 0, "warn": 1, "stop": 2}
-        if rank[action] > rank[verdict["action"]]:
+        rank = {"allow": 0, "warn": 1, "final": 2, "stop": 3}
+        if rank[tier] > rank[verdict["tier"] or "allow"]:
             verdict = {"action": action, "key": key, "pct": pct, "cap": cap,
                        "resets_at": sample["resets_at"], "age": sample["age"],
-                       "expires_at": expires_at}
+                       "expires_at": expires_at, "tier": tier}
     return verdict
 
 
@@ -478,6 +486,13 @@ def warn_message(verdict: dict, now: float | None = None) -> str:
     tail = ""
     if verdict.get("resets_at"):
         tail = f", resets in {fmt_duration(float(verdict['resets_at']) - now)}"
+    if verdict.get("tier") == "final":
+        # Close enough that one large turn can cross it, so the number that
+        # matters is the room left, not the percentage already spent.
+        room = float(verdict["cap"]) - float(verdict["pct"])
+        return (f"governor: {window} usage {verdict['pct']:.1f}%, {room:.1f} points under "
+                f"your {verdict['cap']:.0f}% cap{tail}. The next turn may reach it - "
+                f"finish up, or raise the cap now.")
     return (f"governor: {window} usage {verdict['pct']:.1f}% of your {verdict['cap']:.0f}% cap"
             f"{tail}. Work will stop at the cap.")
 
@@ -507,12 +522,17 @@ def is_self_call(event: str, payload: dict) -> bool:
     return bool(SELF_CALL_RE.search(command)) or str(STABLE_BIN) in command
 
 
-def throttled_warn(interval: float = 300.0, now: float | None = None) -> bool:
+def throttled_warn(tier: str, interval: float = 300.0, now: float | None = None) -> bool:
+    """Rate-limit warnings, but never sit on a change of tier.
+
+    Crossing from `warn` into `final` is news. Holding it back for the rest of
+    the interval would deliver it after the halt it was meant to precede.
+    """
     now = time.time() if now is None else now
     data = _read_json(WARN_PATH, {}) or {}
-    if now - float(data.get("last") or 0) < interval:
+    if data.get("tier") == tier and now - float(data.get("last") or 0) < interval:
         return False
-    _write_json(WARN_PATH, {"last": now})
+    _write_json(WARN_PATH, {"last": now, "tier": tier})
     return True
 
 
@@ -537,7 +557,7 @@ def cmd_guard(args) -> int:
         sys.stdout.write("\n")
         return 0
     if verdict["action"] in ("stop", "warn"):
-        if throttled_warn():
+        if throttled_warn(verdict.get("tier") or "warn"):
             message = (stop_message(verdict, cfg) if verdict["action"] == "stop"
                        else warn_message(verdict))
             json.dump({"systemMessage": message, "suppressOutput": True}, sys.stdout)

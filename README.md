@@ -137,6 +137,23 @@ Once stopped, `UserPromptSubmit` refuses new prompts too, so the task cannot be
 casually restarted. When the window rolls over, the sample expires and the
 guard releases on its own — no command needed.
 
+## Warnings
+
+Two of them. The first at `warn_ratio` (80% of your cap) says how much is spent.
+The second at `escalate_ratio` (95%) says how much room is **left**, in points,
+because at that distance a single large turn can cross the rest:
+
+```
+governor: 5h usage 48.5%, 1.5 points under your 50% cap, resets in 1h00m.
+The next turn may reach it - finish up, or raise the cap now.
+```
+
+Warnings are rate-limited to one per five minutes, but a change of tier is never
+held back — escalation delivered after the halt it was meant to precede would be
+worthless. An `escalate_ratio` that is not strictly above `warn_ratio` switches
+the second tier off entirely; it could not be reached without swallowing the
+first warning.
+
 ## Caps that release themselves
 
 ```
@@ -170,6 +187,7 @@ whether or not anything has cleaned it up yet.
 | `five_hour_expires_at` | `null` | unix time the 5h cap releases itself (`--for`) |
 | `seven_day_expires_at` | `null` | same for the weekly cap |
 | `warn_ratio` | `0.8` | warn once past this fraction of the cap |
+| `escalate_ratio` | `0.95` | warn again, louder, this close to the cap |
 | `mode` | `stop` | `stop` halts the agent, `warn` only tells you |
 | `show_tokens` | `true` | token counter in the status line |
 | `show_weekly` | `auto` | `auto` shows 7d when capped or above 50% |

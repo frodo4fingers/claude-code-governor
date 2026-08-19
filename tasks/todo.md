@@ -22,7 +22,7 @@
       `anthropic-ratelimit-unified-7d_oi-*`, model-specific weekly buckets)
 - [ ] Optional token-budget cap for API-key users (no rate_limits headers)
 - [x] One-shot install.sh - marketplace + plugin + status line via settings alone
-- [ ] Publish as a git repo so the other account holder can install it by URL
+- [x] Publish as a git repo so the other account holder can install it by URL
 
 ## Review
 
@@ -43,5 +43,5 @@ sample taken by an interactive session. Documented rather than hidden.
 - [x] statusLine points at ~/.claude/governor/bin/governor, not a versioned cache dir
       (a plugin update deletes the old directory and would break the gauge)
 - [x] `install` skips marketplace registration when already installed from one
-- [ ] push to github.com/frodo4fingers/claude-code-governor
-- [ ] tag v0.2.0 once pushed (`claude plugin tag` validates manifest agreement)
+- [x] push to github.com/frodo4fingers/claude-code-governor
+- [x] tag v0.2.0 once pushed (`claude plugin tag` validates manifest agreement)

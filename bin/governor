@@ -38,6 +38,7 @@ CONFIG_PATH = HOME / "config.json"
 STATE_PATH = HOME / "state.json"
 INDEX_PATH = HOME / "index.json"
 WARN_PATH = HOME / "warn.json"
+LOG_PATH = HOME / "log.jsonl"
 STABLE_BIN = HOME / "bin" / "governor"
 SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 USER_COMMAND_PATH = Path.home() / ".claude" / "commands" / "governor.md"
@@ -46,6 +47,8 @@ TRANSCRIPT_GLOB = (os.environ.get("GOVERNOR_TRANSCRIPTS")
 
 FIVE_HOURS = 5 * 3600
 SEVEN_DAYS = 7 * 86400
+LOG_KEEP_DAYS = 30
+LOG_MAX_BYTES = 128 * 1024
 
 DEFAULT_CONFIG = {
     "enabled": True,
@@ -108,6 +111,61 @@ def read_stdin_json() -> dict:
     except ValueError:
         return {}
     return data if isinstance(data, dict) else {}
+
+
+# --------------------------------------------------------------------------- history
+
+def log_event(event: str, now: float | None = None, **fields) -> None:
+    """Append one line to the history. Bookkeeping - it must never raise."""
+    now = time.time() if now is None else now
+    record = {"ts": round(now, 3), "event": event}
+    record.update({k: v for k, v in fields.items() if v is not None})
+    try:
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(LOG_PATH, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, separators=(",", ":")) + "\n")
+        if LOG_PATH.stat().st_size > LOG_MAX_BYTES:
+            trim_log(now)
+    except OSError:
+        pass
+
+
+def read_log(since: float | None = None) -> list:
+    records = []
+    try:
+        with open(LOG_PATH, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                if since is not None and float(record.get("ts") or 0) < since:
+                    continue
+                records.append(record)
+    except OSError:
+        return []
+    return records
+
+
+def trim_log(now: float | None = None) -> None:
+    now = time.time() if now is None else now
+    kept = read_log(since=now - LOG_KEEP_DAYS * 86400)
+    tmp = LOG_PATH.with_name(f".log.{os.getpid()}")
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            for record in kept:
+                fh.write(json.dumps(record, separators=(",", ":")) + "\n")
+        os.replace(tmp, LOG_PATH)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
 
 # --------------------------------------------------------------------------- limits
@@ -195,6 +253,7 @@ def expire_caps(cfg: dict, now: float | None = None) -> bool:
         if expires_at is None:
             continue
         if now >= float(expires_at):
+            log_event("expired", now=now, key=_key, cap=cfg.get(cap_field))
             cfg[cap_field] = None
             cfg[expiry_field] = None
             changed = True
@@ -499,7 +558,7 @@ def warn_message(verdict: dict, now: float | None = None) -> str:
 
 # --------------------------------------------------------------------------- guard
 
-SUBCOMMANDS = ("status", "set", "off", "on", "pause", "config", "index",
+SUBCOMMANDS = ("status", "set", "off", "on", "pause", "config", "index", "log",
                "install", "uninstall", "guard", "statusline", "session-start")
 # Matches the binary however it is spelled - bare name, absolute path, ~ path,
 # quoted - as long as one of our subcommands follows it.
@@ -532,7 +591,25 @@ def throttled_warn(tier: str, interval: float = 300.0, now: float | None = None)
     data = _read_json(WARN_PATH, {}) or {}
     if data.get("tier") == tier and now - float(data.get("last") or 0) < interval:
         return False
-    _write_json(WARN_PATH, {"last": now, "tier": tier})
+    data.update({"last": now, "tier": tier})   # the file also carries logged_stop
+    _write_json(WARN_PATH, data)
+    return True
+
+
+def log_stop_once(verdict: dict, now: float | None = None) -> bool:
+    """Record a halt once per usage window, not once per blocked tool call.
+
+    The guard fires before every tool call, so a naive append would write
+    hundreds of identical lines for a single cap being reached.
+    """
+    now = time.time() if now is None else now
+    marker = f"{verdict['key']}:{verdict.get('resets_at')}"
+    data = _read_json(WARN_PATH, {}) or {}
+    if data.get("logged_stop") == marker:
+        return False
+    log_event("stop", now=now, key=verdict["key"], pct=verdict["pct"], cap=verdict["cap"])
+    data["logged_stop"] = marker
+    _write_json(WARN_PATH, data)
     return True
 
 
@@ -551,6 +628,8 @@ def cmd_guard(args) -> int:
 
     state = _read_json(STATE_PATH, {}) or {}
     verdict = evaluate(cfg, state)
+    if verdict["action"] == "stop":
+        log_stop_once(verdict)
 
     if verdict["action"] == "stop" and cfg.get("mode", "stop") == "stop":
         json.dump({"continue": False, "stopReason": stop_message(verdict, cfg)}, sys.stdout)
@@ -660,6 +739,8 @@ def cmd_set(args) -> int:
     cfg[field] = cap
     cfg[expiry_field] = expires
     cfg["enabled"] = True
+    log_event("set", key="seven_day" if args.weekly else "five_hour",
+              cap=cap, expires_at=expires)
     if args.note is not None:
         cfg["note"] = args.note or None
     if args.warn is not None:
@@ -679,6 +760,8 @@ def cmd_off(args) -> int:
     else:
         cleared = ("five_hour",)
     for name in cleared:
+        if cfg.get(f"{name}_cap") is not None:
+            log_event("off", key=name, cap=cfg[f"{name}_cap"])
         cfg[f"{name}_cap"] = None
         cfg[f"{name}_expires_at"] = None
     cfg["enabled"] = True
@@ -688,6 +771,7 @@ def cmd_off(args) -> int:
 
 def cmd_pause(args) -> int:
     cfg = load_config()
+    log_event("pause")
     cfg["enabled"] = False
     save_config(cfg)
     return cmd_status(args)
@@ -695,6 +779,7 @@ def cmd_pause(args) -> int:
 
 def cmd_on(args) -> int:
     cfg = load_config()
+    log_event("resume")
     cfg["enabled"] = True
     save_config(cfg)
     return cmd_status(args)
@@ -790,6 +875,40 @@ def cmd_status(args) -> int:
     print(f"  verdict     {verdict['action']}")
     if verdict["action"] == "stop":
         print(f"              {stop_message(verdict, cfg, now)}")
+    return 0
+
+
+def cmd_log(args) -> int:
+    now = time.time()
+    records = read_log(since=now - args.days * 86400 if args.days else None)
+    if getattr(args, "json", False):
+        print(json.dumps(records, indent=2))
+        return 0
+    if not records:
+        print("governor: no history in that range")
+        return 0
+
+    window = {"five_hour": "5h", "seven_day": "7d"}
+    for record in records:
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(record.get("ts") or 0)))
+        key = window.get(record.get("key"), record.get("key") or "")
+        cap = record.get("cap")
+        event = record.get("event", "?")
+        if event == "stop":
+            detail = f"{record.get('pct', 0):.1f}% used, cap {float(cap):.0f}%"
+        elif event == "set":
+            detail = f"cap {float(cap):.0f}%"
+            if record.get("expires_at"):
+                detail += (" until "
+                           + time.strftime("%H:%M", time.localtime(float(record["expires_at"]))))
+        elif event in ("off", "expired"):
+            detail = f"cap {float(cap):.0f}% removed" if cap is not None else "cap removed"
+        else:
+            detail = ""
+        print(f"  {when}  {event:<8} {key:<3} {detail}".rstrip())
+
+    stops = sum(1 for r in records if r.get("event") == "stop")
+    print(f"\n  {len(records)} entries, {stops} halt{'' if stops == 1 else 's'}")
     return 0
 
 
@@ -1028,6 +1147,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("key", nargs="?")
     p.add_argument("value", nargs="?")
     p.set_defaults(func=cmd_config)
+
+    p = sub.add_parser("log", help="history of caps set, hit and released")
+    p.add_argument("--days", type=float, default=7.0, help="0 for everything")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_log)
 
     p = sub.add_parser("index", help="refresh the token index")
     p.add_argument("--budget", type=float, default=5.0)

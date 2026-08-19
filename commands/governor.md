@@ -1,6 +1,6 @@
 ---
 description: Cap your share of the Claude Code usage window, or inspect where you stand
-argument-hint: "[50 | 50 for 3h | weekly 80 | off | pause | on | status]"
+argument-hint: "[50 | 50 for 3h | weekly 80 | off | pause | on | status | log]"
 allowed-tools: Bash(python3:*)
 ---
 
@@ -23,6 +23,9 @@ Translate them like this:
 | `weekly 80`             | `set 80 --weekly`                      |
 | `off`                   | `off`                                  |
 | `off all`               | `off --all`                            |
+| `log`                   | `log`                                  |
+| `log 30`                | `log --days 30`                        |
+| `log all`               | `log --days 0`                         |
 | `pause`                 | `pause`                                |
 | `on`                    | `on`                                   |
 | `note <text>`           | `config note "<text>"`                 |

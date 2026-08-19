@@ -63,6 +63,7 @@ class Sandboxed(unittest.TestCase):
             "STATE_PATH": self.tmp / "state.json",
             "INDEX_PATH": self.tmp / "index.json",
             "WARN_PATH": self.tmp / "warn.json",
+            "LOG_PATH": self.tmp / "log.jsonl",
             "STABLE_BIN": self.tmp / "bin" / "governor",
             "TRANSCRIPT_GLOB": str(self.projects / "*" / "*.jsonl"),
         })
@@ -463,6 +464,66 @@ class TestWarnThrottle(Sandboxed):
         self.assertFalse(gov.throttled_warn("final", now=1002.0))
 
 
+class TestHistory(Sandboxed):
+    def test_round_trip(self):
+        gov.log_event("set", now=1000.0, key="five_hour", cap=50.0)
+        gov.log_event("stop", now=1010.0, key="five_hour", pct=55.4, cap=50.0)
+        records = gov.read_log()
+        self.assertEqual([r["event"] for r in records], ["set", "stop"])
+        self.assertEqual(records[1]["pct"], 55.4)
+
+    def test_none_fields_are_dropped(self):
+        gov.log_event("pause", now=1000.0, key=None, cap=None)
+        self.assertEqual(gov.read_log()[0], {"ts": 1000.0, "event": "pause"})
+
+    def test_unreadable_lines_are_skipped(self):
+        gov.log_event("set", now=1000.0, cap=50.0)
+        with open(gov.LOG_PATH, "a", encoding="utf-8") as fh:
+            fh.write("not json\n\n[1,2,3]\n")
+        gov.log_event("off", now=1001.0)
+        self.assertEqual([r["event"] for r in gov.read_log()], ["set", "off"])
+
+    def test_since_filter(self):
+        gov.log_event("set", now=1000.0)
+        gov.log_event("off", now=2000.0)
+        self.assertEqual([r["event"] for r in gov.read_log(since=1500.0)], ["off"])
+
+    def test_trim_drops_what_is_past_the_horizon(self):
+        now = 1_000_000.0
+        gov.log_event("set", now=now - (gov.LOG_KEEP_DAYS + 1) * 86400)
+        gov.log_event("off", now=now - 60)
+        gov.trim_log(now)
+        self.assertEqual([r["event"] for r in gov.read_log()], ["off"])
+
+    def test_a_missing_file_reads_as_empty(self):
+        self.assertEqual(gov.read_log(), [])
+
+
+class TestStopIsLoggedOncePerWindow(Sandboxed):
+    def verdict(self, resets_at, pct=55.0):
+        return {"action": "stop", "key": "five_hour", "pct": pct, "cap": 50.0,
+                "resets_at": resets_at}
+
+    def test_repeated_calls_write_one_line(self):
+        # The guard fires before every tool call; a naive append would write
+        # hundreds of identical lines for one cap being reached.
+        for _ in range(5):
+            gov.log_stop_once(self.verdict(2000.0), now=1000.0)
+        self.assertEqual(len(gov.read_log()), 1)
+
+    def test_a_new_window_is_logged_again(self):
+        gov.log_stop_once(self.verdict(2000.0), now=1000.0)
+        gov.log_stop_once(self.verdict(9999.0), now=3000.0)
+        self.assertEqual(len(gov.read_log()), 2)
+
+    def test_the_marker_survives_a_warning(self):
+        # Both live in warn.json; the throttle used to replace the whole file.
+        gov.log_stop_once(self.verdict(2000.0), now=1000.0)
+        gov.throttled_warn("final", now=1001.0)
+        gov.log_stop_once(self.verdict(2000.0), now=1002.0)
+        self.assertEqual(len(gov.read_log()), 1)
+
+
 # ---------------------------------------------------------------- token index
 
 class TestTokenAccounting(unittest.TestCase):
@@ -717,6 +778,19 @@ class TestGuardProcess(Sandboxed):
         second = self.run_guard({"tool_name": "Bash", "tool_input": {"command": "ls"}})
         self.assertIn("points under your 50% cap", second["systemMessage"])
 
+    def test_a_halt_is_logged_once_however_many_calls_it_blocks(self):
+        self.arm()
+        for _ in range(4):
+            self.run_guard({"tool_name": "Bash", "tool_input": {"command": "ls"}})
+        records = [r for r in gov.read_log() if r["event"] == "stop"]
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["cap"], 50)
+
+    def test_a_halt_in_warn_mode_is_still_logged(self):
+        self.arm(mode="warn")
+        self.run_guard({"tool_name": "Bash", "tool_input": {"command": "ls"}})
+        self.assertEqual([r["event"] for r in gov.read_log()], ["stop"])
+
     def test_no_cap_is_a_no_op(self):
         (self.tmp / "config.json").write_text(json.dumps(dict(gov.DEFAULT_CONFIG)))
         self.assertIsNone(self.run_guard({"tool_name": "Bash",
@@ -855,6 +929,41 @@ class TestCliProcess(Sandboxed):
                                                 "tool_input": {"command": "ls"}}),
                               capture_output=True, text=True, env=environ, timeout=30)
         self.assertEqual(proc.stdout.strip(), "")
+
+    def test_cap_changes_are_recorded(self):
+        self.run_cli("set", "50")
+        self.run_cli("pause")
+        self.run_cli("on")
+        self.run_cli("off")
+        events = [r["event"] for r in json.loads(
+            self.run_cli("log", "--json").stdout)]
+        self.assertEqual(events, ["set", "pause", "resume", "off"])
+
+    def test_off_without_a_cap_records_nothing(self):
+        self.run_cli("off")
+        self.assertEqual(json.loads(self.run_cli("log", "--json").stdout), [])
+
+    def test_an_expired_cap_is_recorded_when_it_is_cleared(self):
+        (self.tmp / "config.json").write_text(json.dumps(dict(
+            gov.DEFAULT_CONFIG, show_tokens=False, five_hour_cap=50,
+            five_hour_expires_at=time.time() - 1)))
+        self.run_cli("statusline", stdin="{}")
+        records = json.loads(self.run_cli("log", "--json").stdout)
+        self.assertEqual([r["event"] for r in records], ["expired"])
+        self.assertEqual(records[0]["cap"], 50)
+
+    def test_log_days_filters(self):
+        self.run_cli("set", "50")
+        recent = json.loads(self.run_cli("log", "--days", "7", "--json").stdout)
+        self.assertEqual(len(recent), 1)
+        # A window that ended before the entry was written excludes it.
+        with open(self.tmp / "log.jsonl", "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"ts": time.time() - 40 * 86400, "event": "set"}) + "\n")
+        self.assertEqual(json.loads(self.run_cli("log", "--days", "7", "--json").stdout), [])
+        self.assertEqual(len(json.loads(self.run_cli("log", "--days", "0", "--json").stdout)), 1)
+
+    def test_log_says_so_when_there_is_nothing(self):
+        self.assertIn("no history", self.run_cli("log").stdout)
 
     def test_statusline_persists_state_and_prints_a_gauge(self):
         now = time.time()

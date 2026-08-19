@@ -20,6 +20,7 @@ wanted for the rest of the day.
 /governor 50 for 3h   same, but the cap releases itself after three hours
 /governor weekly 80   same for the weekly window
 /governor status      where do I stand
+/governor log         what has happened - caps set, hit, released
 /governor pause       keep the cap, stop enforcing it
 /governor off         drop the cap
 ```
@@ -174,6 +175,26 @@ Nothing runs in the background to do the removal. The status line and the
 session-start hook clear an expired cap the next time they run, and `evaluate`
 ignores one that has passed, so the cap stops applying at the moment it expires
 whether or not anything has cleaned it up yet.
+
+## History
+
+```
+$ governor log
+  2026-08-19 08:08  set      5h  cap 50% until 11:08
+  2026-08-19 09:41  stop     5h  55.4% used, cap 50%
+  2026-08-19 11:08  expired  5h  cap 50% removed
+
+  3 entries, 1 halt
+```
+
+`~/.claude/governor/log.jsonl`, one JSON object per line, trimmed to 30 days.
+Records caps set and removed, caps that released themselves, pauses, and halts.
+`--days N` narrows the range (`--days 0` for everything) and `--json` prints the
+raw records.
+
+A halt is recorded **once per usage window**, not once per blocked tool call —
+the guard runs before every call, so the obvious implementation writes hundreds
+of identical lines for a single cap being reached.
 
 ## Config
 
